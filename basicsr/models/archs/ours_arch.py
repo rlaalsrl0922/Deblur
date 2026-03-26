@@ -4,7 +4,6 @@ import torch.nn.functional as F
 
 from basicsr.models.archs.main_arch_ours import (
     UPT,
-    EventGuidedGlobalAttentionFusion,
     EventGuidedVarFusion,
     WCFEBlock,
     ResidualBlock
@@ -21,7 +20,6 @@ class EFNetOurs(nn.Module):
         fuse_before_downsample=True,
         relu_slope=0.2,
         num_heads=[1, 2, 4],
-        var_fusion_type="cvwarp",
         var_fusion_max_disp=1,
         var_fusion_num_heads=4,
         var_fusion_kv_downsample=4,
@@ -30,8 +28,6 @@ class EFNetOurs(nn.Module):
         self.depth = depth
         self.fuse_before_downsample = fuse_before_downsample
         self.num_heads = num_heads
-        if var_fusion_type not in {"cvwarp", "global_attn"}:
-            raise ValueError("var_fusion_type must be one of: {'cvwarp', 'global_attn'}")
         self.var_fusion_type = var_fusion_type
         self.var_fusion_max_disp = var_fusion_max_disp
         self.var_fusion_num_heads = var_fusion_num_heads
@@ -54,7 +50,7 @@ class EFNetOurs(nn.Module):
                     downsample,
                     relu_slope,
                     num_heads=self.num_heads[i],
-                    use_wcfe=self.num_heads[i],
+                    use_wcfe=True,
                     use_hf_branch=False,
                 )
             )
@@ -64,7 +60,9 @@ class EFNetOurs(nn.Module):
                     (2**i) * wf,
                     downsample,
                     relu_slope,
-                    use_hf_branch=False,
+                    num_heads=self.num_heads[i],
+                    use_wcfe=True,
+                    use_hf_branch=True,
                 )
             )
             self.down_path_ev.append(UNetEVConvBlock(prev_channels, (2**i) * wf, downsample, relu_slope))
@@ -82,18 +80,9 @@ class EFNetOurs(nn.Module):
             self.up_path_1.append(UNetUpBlock(prev_channels, (2**i) * wf, relu_slope))
             self.up_path_2.append(UNetUpBlock(prev_channels, (2**i) * wf, relu_slope))
             self.up_path_1_memory.append(UPT(dim=stage_channels, num_blocks=1, dim_head=stage_channels, heads=1))
-            if self.var_fusion_type == "cvwarp":
-                self.up_path_1_var_fusion.append(
-                    EventGuidedVarFusion(channels=stage_channels, max_disp=self.var_fusion_max_disp)
-                )
-            else:
-                self.up_path_1_var_fusion.append(
-                    EventGuidedGlobalAttentionFusion(
-                        channels=stage_channels,
-                        num_heads=self.var_fusion_num_heads,
-                        kv_downsample=self.var_fusion_kv_downsample,
-                    )
-                )
+            self.up_path_1_var_fusion.append(
+                EventGuidedVarFusion(channels=stage_channels, max_disp=self.var_fusion_max_disp)
+            )
             self.up_path_1_var.append(
                 nn.Sequential(
                     nn.Conv2d(stage_channels, stage_channels, 3, 1, 1),
@@ -202,7 +191,6 @@ class UNetConvBlock(nn.Module):
         out_size,
         downsample,
         relu_slope,
-        use_emgc=False,
         num_heads=None,
         use_wcfe=None,
         use_hf_branch=False,
@@ -210,7 +198,6 @@ class UNetConvBlock(nn.Module):
         super(UNetConvBlock, self).__init__()
         self.downsample = downsample
         self.identity = nn.Conv2d(in_size, out_size, 1, 1, 0)
-        self.use_emgc = use_emgc
         self.num_heads = num_heads
         self.use_wcfe = use_wcfe
         self.use_hf_branch = use_hf_branch
@@ -237,11 +224,11 @@ class UNetConvBlock(nn.Module):
                 LayerNorm_type="WithBias",
             )
 
-        if self.use_wcfe is not None:
+        if self.use_wcfe:
             self.image_event_wcfe = WCFEBlock(
                 dim=out_size,
                 num_frames=1,
-                num_heads=self.use_wcfe,
+                num_heads=self.num_heads,
                 ffn_expansion=4,
                 bias=False,
             )
@@ -258,12 +245,6 @@ class UNetConvBlock(nn.Module):
             hf = self.hf_conv(hf)
             gate = torch.sigmoid(self.hf_event_gate(torch.cat([out, event_filter], dim=1)))
             out = out + gate * hf
-
-        if enc is not None and dec is not None and mask is not None:
-            assert self.use_emgc
-            out_enc = self.emgc_enc(enc) + self.emgc_enc_mask((1 - mask) * enc)
-            out_dec = self.emgc_dec(dec) + self.emgc_dec_mask(mask * dec)
-            out = out + out_enc + out_dec
 
         if self.num_heads is not None:
             out = self.image_event_transformer(out, event_filter)
@@ -286,23 +267,16 @@ class UNetConvBlock(nn.Module):
 
 
 class UNetEVConvBlock(nn.Module):
-    def __init__(self, in_size, out_size, downsample, relu_slope, use_emgc=False):
+    def __init__(self, in_size, out_size, downsample, relu_slope):
         super(UNetEVConvBlock, self).__init__()
         self.downsample = downsample
         self.identity = nn.Conv2d(in_size, out_size, 1, 1, 0)
-        self.use_emgc = use_emgc
 
         self.conv_1 = nn.Conv2d(in_size, out_size, kernel_size=3, padding=1, bias=True)
         self.relu_1 = nn.LeakyReLU(relu_slope, inplace=False)
         self.conv_2 = nn.Conv2d(out_size, out_size, kernel_size=3, padding=1, bias=True)
         self.relu_2 = nn.LeakyReLU(relu_slope, inplace=False)
         self.conv_before_merge = nn.Conv2d(out_size, out_size, 1, 1, 0)
-
-        if downsample and use_emgc:
-            self.emgc_enc = nn.Conv2d(out_size, out_size, 3, 1, 1)
-            self.emgc_dec = nn.Conv2d(out_size, out_size, 3, 1, 1)
-            self.emgc_enc_mask = nn.Conv2d(out_size, out_size, 3, 1, 1)
-            self.emgc_dec_mask = nn.Conv2d(out_size, out_size, 3, 1, 1)
 
         if downsample:
             self.downsample = conv_down(out_size, out_size, bias=False)

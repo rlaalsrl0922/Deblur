@@ -335,44 +335,6 @@ class EventGuidedVarFusion(nn.Module):
         return image_feat + attn * warped_event
 
 
-class EventGuidedGlobalAttentionFusion(nn.Module):
-    def __init__(self, channels, num_heads=4, kv_downsample=4):
-        super().__init__()
-        if channels % num_heads != 0:
-            raise ValueError("channels must be divisible by num_heads for global_attn fusion")
-        if kv_downsample < 1:
-            raise ValueError("kv_downsample must be >= 1")
-        self.channels = channels
-        self.num_heads = num_heads
-        self.head_dim = channels // num_heads
-        self.scale = self.head_dim ** -0.5
-        self.kv_downsample = kv_downsample
-        self.q_proj = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
-        self.k_proj = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
-        self.v_proj = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
-        self.out_proj = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
-
-    def forward(self, image_feat, event_feat):
-        b, c, h, w = image_feat.shape
-        event_feat = F.interpolate(event_feat, size=(h, w), mode="bilinear", align_corners=False)
-        if self.kv_downsample > 1:
-            event_kv = F.avg_pool2d(event_feat, kernel_size=self.kv_downsample, stride=self.kv_downsample)
-        else:
-            event_kv = event_feat
-
-        hk, wk = event_kv.shape[-2:]
-        q = self.q_proj(image_feat).view(b, self.num_heads, self.head_dim, h * w).permute(0, 1, 3, 2)
-        k = self.k_proj(event_kv).view(b, self.num_heads, self.head_dim, hk * wk).permute(0, 1, 3, 2)
-        v = self.v_proj(event_kv).view(b, self.num_heads, self.head_dim, hk * wk).permute(0, 1, 3, 2)
-
-        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        out = torch.matmul(attn, v)
-        out = out.permute(0, 1, 3, 2).contiguous().view(b, c, h, w)
-        out = self.out_proj(out)
-        return image_feat + out
-
-
 def _flatten_bt(x):
     if x.dim() == 4:
         b, c, h, w = x.shape

@@ -1,5 +1,5 @@
 # general settings
-name: EFNet_Ours
+name: EFNet_Ours_debug
 model_type: ImageEventRestorationOurs
 scale: 1
 num_gpu: 1 #4
@@ -31,7 +31,7 @@ datasets:
     # data loader settings
     use_shuffle: true
     num_worker_per_gpu: 1
-    batch_size_per_gpu: 4 # 4 for 2080, 8 for titan
+    batch_size_per_gpu: 2 # 4 for 2080, 8 for titan
     dataset_enlarge_ratio: 2
     prefetch_mode: cuda
     num_prefetch_queue: 2
@@ -68,7 +68,6 @@ network_g:
   fuse_before_downsample: true
   relu_slope: 0.2
   num_heads: [1, 2, 4]
-  var_fusion_type: global_channel_attn
   var_fusion_max_disp: 1
   var_fusion_num_heads: 4
   var_fusion_kv_downsample: 4
@@ -133,7 +132,7 @@ logger:
   save_checkpoint_freq: !!float 2e4
   use_tb_logger: true
   wandb:
-    project: EMDeblur
+    project:
     resume_id:
 
 # dist training settings
