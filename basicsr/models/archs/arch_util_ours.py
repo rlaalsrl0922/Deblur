@@ -1,0 +1,258 @@
+import math
+import numbers
+
+import torch
+from torch import nn as nn
+from torch.nn import functional as F
+from torch.nn.utils import weight_norm
+from einops import rearrange
+from torchvision.ops import deform_conv2d
+
+
+def conv3x3(in_chn, out_chn, bias=True):
+    return nn.Conv2d(in_chn, out_chn, kernel_size=3, stride=1, padding=1, bias=bias)
+
+
+def conv_down(in_chn, out_chn, bias=False):
+    return nn.Conv2d(in_chn, out_chn, kernel_size=4, stride=2, padding=1, bias=bias)
+
+
+def conv(in_channels, out_channels, kernel_size, bias=False, stride=1):
+    return nn.Conv2d(
+        in_channels,
+        out_channels,
+        kernel_size,
+        padding=(kernel_size // 2),
+        bias=bias,
+        stride=stride,
+    )
+
+
+class SAM(nn.Module):
+    def __init__(self, n_feat, kernel_size=3, bias=True):
+        super(SAM, self).__init__()
+        self.conv1 = conv(n_feat, n_feat, kernel_size, bias=bias)
+        self.conv2 = conv(n_feat, 3, kernel_size, bias=bias)
+        self.conv3 = conv(3, n_feat, kernel_size, bias=bias)
+
+    def forward(self, x, x_img):
+        x1 = self.conv1(x)
+        img = self.conv2(x) + x_img
+        x2 = torch.sigmoid(self.conv3(img))
+        x1 = x1 * x2
+        x1 = x1 + x
+        return x1, img
+
+def to_3d(x):
+    return rearrange(x, "b c h w -> b (h w) c")
+
+
+def to_4d(x, h, w):
+    return rearrange(x, "b (h w) c -> b c h w", h=h, w=w)
+
+
+class BiasFree_LayerNorm(nn.Module):
+    def __init__(self, normalized_shape):
+        super(BiasFree_LayerNorm, self).__init__()
+        if isinstance(normalized_shape, numbers.Integral):
+            normalized_shape = (normalized_shape,)
+        normalized_shape = torch.Size(normalized_shape)
+
+        assert len(normalized_shape) == 1
+
+        self.weight = nn.Parameter(torch.ones(normalized_shape))
+        self.normalized_shape = normalized_shape
+
+    def forward(self, x):
+        sigma = x.var(-1, keepdim=True, unbiased=False)
+        return x / torch.sqrt(sigma + 1e-5) * self.weight
+
+
+class WithBias_LayerNorm(nn.Module):
+    def __init__(self, normalized_shape):
+        super(WithBias_LayerNorm, self).__init__()
+        if isinstance(normalized_shape, numbers.Integral):
+            normalized_shape = (normalized_shape,)
+        normalized_shape = torch.Size(normalized_shape)
+
+        assert len(normalized_shape) == 1
+
+        self.weight = nn.Parameter(torch.ones(normalized_shape))
+        self.bias = nn.Parameter(torch.zeros(normalized_shape))
+        self.normalized_shape = normalized_shape
+
+    def forward(self, x):
+        mu = x.mean(-1, keepdim=True)
+        sigma = x.var(-1, keepdim=True, unbiased=False)
+        return (x - mu) / torch.sqrt(sigma + 1e-5) * self.weight + self.bias
+
+
+class LayerNorm(nn.Module):
+    def __init__(self, dim, LayerNorm_type):
+        super(LayerNorm, self).__init__()
+        if LayerNorm_type == "BiasFree":
+            self.body = BiasFree_LayerNorm(dim)
+        else:
+            self.body = WithBias_LayerNorm(dim)
+
+    def forward(self, x):
+        h, w = x.shape[-2:]
+        return to_4d(self.body(to_3d(x)), h, w)
+
+
+class Mutual_Attention(nn.Module):
+    def __init__(self, dim, num_heads, bias):
+        super(Mutual_Attention, self).__init__()
+        self.num_heads = num_heads
+        self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1))
+
+        self.q = nn.Conv2d(dim, dim, kernel_size=1, bias=bias)
+        self.k = nn.Conv2d(dim, dim, kernel_size=1, bias=bias)
+        self.v = nn.Conv2d(dim, dim, kernel_size=1, bias=bias)
+        self.project_out = nn.Conv2d(dim, dim, kernel_size=1, bias=bias)
+
+    def forward(self, x, y):
+        assert x.shape == y.shape, "The shape of feature maps from image and event branch are not equal!"
+
+        b, c, h, w = x.shape
+        q = self.q(x)
+        k = self.k(y)
+        v = self.v(y)
+
+        q = rearrange(q, "b (head c) h w -> b head c (h w)", head=self.num_heads)
+        k = rearrange(k, "b (head c) h w -> b head c (h w)", head=self.num_heads)
+        v = rearrange(v, "b (head c) h w -> b head c (h w)", head=self.num_heads)
+
+        q = F.normalize(q, dim=-1)
+        k = F.normalize(k, dim=-1)
+
+        attn = (q @ k.transpose(-2, -1)) * self.temperature
+        attn = attn.softmax(dim=-1)
+        out = attn @ v
+        out = rearrange(out, "b head c (h w) -> b (head c) h w", head=self.num_heads, h=h, w=w)
+        out = self.project_out(out)
+        return out
+
+
+class Mlp(nn.Module):
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.0):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.act = act_layer()
+        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
+
+
+class ResidualBlock(nn.Module):
+    def __init__(self, feats, distillation_rate=0.5):
+        super(ResidualBlock, self).__init__()
+        self.distilled_channels = int(feats // 2 * distillation_rate)
+        self.remaining_channels = int(feats // 2 - self.distilled_channels)
+        self.before_refine = nn.Conv2d(feats, feats, 1, 1, 0)
+        self.c1 = weight_norm(nn.Conv2d(feats, feats // 2, 3, 1, padding=1, groups=1, bias=False))
+        self.c2 = weight_norm(nn.Conv2d(self.remaining_channels, feats // 2, 3, 1, padding=1, groups=1, bias=False))
+        self.c3 = weight_norm(
+            nn.Conv2d(self.remaining_channels, self.distilled_channels, 3, 1, padding=1, groups=1, bias=False)
+        )
+        self.act = nn.LeakyReLU(negative_slope=0.05, inplace=True)
+        self.c5 = weight_norm(
+            nn.Conv2d(self.distilled_channels * 3, feats, 3, 1, padding=1, groups=1, bias=False)
+        )
+        self.after_refine = nn.Conv2d(feats, feats, 1, 1, 0)
+
+    def forward(self, input):
+        input = self.before_refine(input)
+        out_c1 = self.act(self.c1(input))
+        distilled_c1, remaining_c1 = torch.split(out_c1, (self.distilled_channels, self.remaining_channels), dim=1)
+        out_c2 = self.act(self.c2(remaining_c1))
+        distilled_c2, remaining_c2 = torch.split(out_c2, (self.distilled_channels, self.remaining_channels), dim=1)
+        out_c3 = self.act(self.c3(remaining_c2))
+        out = torch.cat([distilled_c1, distilled_c2, out_c3], dim=1)
+        out_fused = self.c5(out) + input
+        out_fused = self.after_refine(out_fused)
+        return out_fused
+
+##########################################################################
+## Event-Image Channel Attention (EICA)
+class EventImage_ChannelAttentionTransformerBlock(nn.Module):
+    def __init__(self, dim, num_heads, ffn_expansion_factor=2, bias=False, LayerNorm_type='WithBias'):
+        super(EventImage_ChannelAttentionTransformerBlock, self).__init__()
+
+        self.norm1_image = LayerNorm(dim, LayerNorm_type)
+        self.norm1_event = LayerNorm(dim, LayerNorm_type)
+        self.attn = Mutual_Attention(dim, num_heads, bias)
+        # mlp
+        self.norm2 = nn.LayerNorm(dim)
+        mlp_hidden_dim = int(dim * ffn_expansion_factor)
+        self.ffn = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=nn.GELU, drop=0.)
+
+    def forward(self, image, event):
+        # image: b, c, h, w
+        # event: b, c, h, w
+        # return: b, c, h, w
+        assert image.shape == event.shape, 'the shape of image doesnt equal to event'
+        b, c , h, w = image.shape
+        fused = image + self.attn(self.norm1_image(image), self.norm1_event(event)) # b, c, h, w
+
+        # mlp
+        fused = to_3d(fused) # b, h*w, c
+        fused = fused + self.ffn(self.norm2(fused))
+        fused = to_4d(fused, h, w)
+
+        return fused
+
+
+##########################################################################
+## Event-Image Channel Attention with DCN (EICA_DCN)
+class EventImage_ChannelAttentionTransformerBlock_w_DCN(nn.Module):
+    def __init__(self, dim, num_heads, ffn_expansion_factor=2, bias=False, LayerNorm_type="WithBias"):
+        super(EventImage_ChannelAttentionTransformerBlock_w_DCN, self).__init__()
+
+        self.norm1_image = LayerNorm(dim, LayerNorm_type)
+        self.norm1_event = LayerNorm(dim, LayerNorm_type)
+        self.attn = Mutual_Attention(dim, num_heads, bias)
+        self.norm2 = nn.LayerNorm(dim)
+        mlp_hidden_dim = int(dim * ffn_expansion_factor)
+        self.ffn = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=nn.GELU, drop=0.0)
+
+        self.deform_weight = nn.Parameter(torch.empty(dim, dim, 3, 3))
+        nn.init.kaiming_uniform_(self.deform_weight, a=math.sqrt(5))
+        self.mlp_of = Mlp(
+            in_features=dim,
+            hidden_features=mlp_hidden_dim,
+            out_features=18,
+            act_layer=nn.GELU,
+            drop=0.0,
+        )
+
+    def forward(self, image, event):
+        assert image.shape == event.shape, "the shape of image doesnt equal to event"
+        b, c, h, w = image.shape
+        fused = image + self.attn(self.norm1_image(image), self.norm1_event(event))
+
+        fused = to_3d(fused)
+        fused = fused + self.ffn(self.norm2(fused))
+        fused = to_4d(fused, h, w)
+
+        event3 = to_3d(event)
+        offset3 = self.mlp_of(event3)
+        offset = to_4d(offset3, h, w)
+
+        fused = deform_conv2d(
+            input=fused,
+            offset=offset,
+            weight=self.deform_weight,
+            bias=None,
+            padding=1,
+        )
+        return fused

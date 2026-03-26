@@ -1,0 +1,64 @@
+# general settings
+name: EFNetOurs_test
+model_type: TestImageEventRestorationModelOurs
+scale: 1
+num_gpu: 1 # set num_gpu: 0 for cpu mode
+manual_seed: 10
+
+# dataset and data loader settings
+datasets:
+  test:
+    name: gopro-bestmodel-test
+    type: H5ImageDataset
+
+    dataroot: /home/minki/workspace/EMDeblur/EFNet/datasets/GOPRO_ev8channel/test # for debug
+
+    # add
+    norm_voxel: true
+    return_voxel: true
+    return_gt_frame: false
+    return_mask: true 
+    use_mask: true 
+
+    crop_size: ~
+    use_flip: false
+    use_rot: false
+    io_backend:
+      type: h5
+
+dataset_name: GoPro
+
+# network structures
+network_g:
+  type: EFNetOurs
+  in_chn: 3
+  ev_chn: 8
+  wf: 64
+  depth: 3
+  fuse_before_downsample: true
+  relu_slope: 0.2
+  num_heads: [1, 2, 4]
+  var_fusion_type: global_channel_attn
+  var_fusion_max_disp: 1
+  var_fusion_num_heads: 4
+  var_fusion_kv_downsample: 4
+
+
+# path
+path:
+  pretrain_network_g: /home/minki/workspace/EFNet/net_g_latest.pth
+  strict_load_g: true
+  resume_state: ~
+  root: /home/minki/workspace/EFNet  # set this option ONLY in TEST!!!
+
+# validation settings
+val:
+  save_img: true
+  grids: ~
+  crop_size: ~
+  rgb2bgr: false # to my h5 data, its false
+
+# dist training settings
+dist_params:
+  backend: nccl
+  port: 29500

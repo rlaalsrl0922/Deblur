@@ -1,0 +1,142 @@
+# general settings
+name: EFNet_Ours
+model_type: ImageEventRestorationOurs
+scale: 1
+num_gpu: 1 #4
+manual_seed: 10
+
+datasets:
+  train:
+    name: gopro-h5-train
+    type: H5ImageDataset
+
+    # dataroot: ./datasets/GoPro_scer/train
+    dataroot: /home/minki/workspace/EMDeblur/EFNet/datasets/GOPRO_ev8channel/train
+
+    # keep true if use events
+    norm_voxel: true
+    return_voxel: true
+
+    return_mask: true
+    use_mask: true
+
+    filename_tmpl: '{}'
+    io_backend:
+      type: h5
+
+    crop_size: 256
+    use_flip: true
+    use_rot: true
+
+    # data loader settings
+    use_shuffle: true
+    num_worker_per_gpu: 1
+    batch_size_per_gpu: 4 # 4 for 2080, 8 for titan
+    dataset_enlarge_ratio: 2
+    prefetch_mode: cuda
+    num_prefetch_queue: 2
+    pin_memory: true
+
+  val:
+    name: gopro-h5-test
+    type: H5ImageDataset
+
+    # dataroot: ./datasets/test
+    dataroot: /home/minki/workspace/EMDeblur/EFNet/datasets/GOPRO_ev8channel/test # for debug
+
+    norm_voxel: true
+    return_voxel: true
+    return_mask: true
+    use_mask: true
+
+    io_backend:
+      type: h5
+
+    crop_size: ~
+    use_flip: false
+    use_rot: false
+
+dataset_name: GoPro
+
+# network structures
+network_g:
+  type: EFNetOurs
+  in_chn: 3
+  ev_chn: 8
+  wf: 64
+  depth: 3
+  fuse_before_downsample: true
+  relu_slope: 0.2
+  num_heads: [1, 2, 4]
+  var_fusion_type: global_channel_attn
+  var_fusion_max_disp: 1
+  var_fusion_num_heads: 4
+  var_fusion_kv_downsample: 4
+
+# path
+path:
+  pretrain_network_g: ~
+  strict_load_g: true
+  resume_state: ~
+  training_states: ~
+
+# training settings
+train:
+  optim_g:
+    type: AdamW
+    lr: !!float 2e-4
+    weight_decay: !!float 1e-4
+    betas: [0.9, 0.99]
+
+  scheduler:
+    type: TrueCosineAnnealingLR
+    T_max: 300000
+    eta_min: !!float 1e-7
+
+  total_iter: 300000
+  warmup_iter: -1
+
+  pixel_opt:
+    type: DualDomainL1Loss
+    loss_weight: 0.5
+    reduction: mean
+    transform: fft
+    freq_weight: 0.1
+    fft_norm: backward
+
+  hf_udl_opt:
+    enable: true
+    loss_weight: 50.0
+
+# validation settings
+val:
+  val_freq: !!float 5e4
+  save_img: false
+  grids: ~
+  crop_size: ~
+  max_minibatch: 8
+
+  metrics:
+    psnr:
+      type: calculate_psnr
+      crop_border: 0
+      test_y_channel: false
+
+    ssim:
+      type: calculate_ssim
+      crop_border: 0
+      test_y_channel: false
+
+# logging settings
+logger:
+  print_freq: 200
+  save_checkpoint_freq: !!float 2e4
+  use_tb_logger: true
+  wandb:
+    project: EMDeblur
+    resume_id:
+
+# dist training settings
+dist_params:
+  backend: nccl
+  port: 29500
