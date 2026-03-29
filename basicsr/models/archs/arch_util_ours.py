@@ -27,6 +27,29 @@ def conv(in_channels, out_channels, kernel_size, bias=False, stride=1):
         stride=stride,
     )
 
+def scer_to_voxel_general(event: torch.Tensor) -> torch.Tensor:
+    assert event.dim() == 4, "event must be (B, C, H, W)"
+    B, C, H, W = event.shape
+    assert C >= 2, "C must be >= 2"
+
+    # 가운데 두 채널 인덱스
+    mid_left  = C // 2 - 1
+    mid_right = C // 2
+
+    edge = torch.zeros_like(event)
+
+    # 왼쪽 구간: i in [0, mid_left-1]  -> forward diff
+    if mid_left > 0:
+        edge[:, :mid_left] = event[:, :mid_left] - event[:, 1:mid_left+1]
+
+    # 가운데 두 채널: 그대로 복사
+    edge[:, mid_left:mid_right+1] = event[:, mid_left:mid_right+1]
+
+    # 오른쪽 구간: i in [mid_right+1, C-1] -> backward diff
+    if mid_right + 1 < C:
+        edge[:, mid_right+1:] = event[:, mid_right+1:] - event[:, mid_right:-1]
+
+    return edge
 
 class SAM(nn.Module):
     def __init__(self, n_feat, kernel_size=3, bias=True):

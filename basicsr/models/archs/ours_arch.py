@@ -8,7 +8,7 @@ from basicsr.models.archs.main_arch_ours import (
     WCFEBlock,
     ResidualBlock
 )
-from basicsr.models.archs.arch_util_ours import EventImage_ChannelAttentionTransformerBlock_w_DCN,EventImage_ChannelAttentionTransformerBlock, ResidualBlock, conv_down, conv3x3, SAM
+from basicsr.models.archs.arch_util_ours import EventImage_ChannelAttentionTransformerBlock, ResidualBlock, conv_down, conv3x3, SAM, scer_to_voxel_general
 
 class EFNetOurs(nn.Module):
     def __init__(
@@ -112,6 +112,8 @@ class EFNetOurs(nn.Module):
 
         ev = []
         event = torch.cat((event[:, :4, :, :], event[:, 5:, :, :]), dim=1)
+        event = scer_to_voxel_general(event)
+        
         e1 = self.conv_ev1(event)
         for i, down in enumerate(self.down_path_ev):
             if i < self.depth - 1:
