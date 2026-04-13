@@ -229,7 +229,6 @@ class UNetConvBlock(nn.Module):
         if self.use_wcfe:
             self.image_event_wcfe = WCFEBlock(
                 dim=out_size,
-                num_frames=1,
                 num_heads=self.num_heads,
                 ffn_expansion=4,
                 bias=False,
