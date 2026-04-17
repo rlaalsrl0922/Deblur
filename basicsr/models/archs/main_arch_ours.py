@@ -5,43 +5,114 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
+from torch.nn.utils import weight_norm
 
-from basicsr.models.archs.arch_util_ours import Mutual_Attention
-
-
-def conv3x3(in_chn, out_chn, bias=True):
-    return nn.Conv2d(in_chn, out_chn, kernel_size=3, stride=1, padding=1, bias=bias)
-
-
-def conv_down(in_chn, out_chn, bias=False):
-    return nn.Conv2d(in_chn, out_chn, kernel_size=4, stride=2, padding=1, bias=bias)
-
-
-def conv(in_channels, out_channels, kernel_size, bias=False, stride=1):
-    return nn.Conv2d(
-        in_channels,
-        out_channels,
-        kernel_size,
-        padding=(kernel_size // 2),
-        bias=bias,
-        stride=stride,
-    )
+from basicsr.models.archs.arch_util_ours import (
+    Mutual_Attention,
+    SAM,
+    conv,
+    conv3x3,
+    conv_down,
+)
 
 
-class SAM(nn.Module):
-    def __init__(self, n_feat, kernel_size=3, bias=True):
-        super(SAM, self).__init__()
-        self.conv1 = conv(n_feat, n_feat, kernel_size, bias=bias)
-        self.conv2 = conv(n_feat, 3, kernel_size, bias=bias)
-        self.conv3 = conv(3, n_feat, kernel_size, bias=bias)
+def scer_to_voxel_general(event: torch.Tensor) -> torch.Tensor:
+    assert event.dim() == 4, "event must be (B, C, H, W)"
+    _, c, _, _ = event.shape
+    assert c >= 2, "C must be >= 2"
 
-    def forward(self, x, x_img):
-        x1 = self.conv1(x)
-        img = self.conv2(x) + x_img
-        x2 = torch.sigmoid(self.conv3(img))
-        x1 = x1 * x2
-        x1 = x1 + x
-        return x1, img
+    mid_left = c // 2 - 1
+    mid_right = c // 2
+    edge = torch.zeros_like(event)
+
+    if mid_left > 0:
+        edge[:, :mid_left] = event[:, :mid_left] - event[:, 1:mid_left + 1]
+
+    edge[:, mid_left:mid_right + 1] = event[:, mid_left:mid_right + 1]
+
+    if mid_right + 1 < c:
+        edge[:, mid_right + 1:] = event[:, mid_right + 1:] - event[:, mid_right:-1]
+
+    return edge
+
+
+def _feature_flow_costvolume(source_feat, target_feat, radius=3, inner_radius=0, temperature=1.0):
+    if temperature <= 0:
+        raise ValueError(f"temperature must be positive, but got {temperature}")
+
+    disps = []
+    costs = []
+    for dy in range(-radius, radius + 1):
+        for dx in range(-radius, radius + 1):
+            if inner_radius > 0 and max(abs(dx), abs(dy)) <= inner_radius:
+                continue
+            shifted = torch.roll(target_feat, shifts=(dy, dx), dims=(2, 3))
+            cost = (source_feat * shifted).mean(dim=1, keepdim=True)
+            costs.append(cost)
+            disps.append((dx, dy))
+
+    if not costs:
+        raise ValueError("No displacement candidates were generated for the given radius and inner_radius.")
+
+    cost_volume = torch.cat(costs, dim=1)
+    prob = F.softmax(cost_volume / temperature, dim=1)
+    disp = source_feat.new_tensor(disps).view(1, -1, 2, 1, 1)
+    flow_x = (prob * disp[:, :, 0]).sum(dim=1, keepdim=True)
+    flow_y = (prob * disp[:, :, 1]).sum(dim=1, keepdim=True)
+    return torch.cat([flow_x, flow_y], dim=1)
+
+
+def _build_symmetric_ev_flow_feature(
+    event,
+    ev_flow_stem,
+    ev_flow_downsample,
+    radius=3,
+    inner_radius=0,
+    temperature=0.1,
+):
+    if event.ndim != 4 or event.shape[1] != 8:
+        raise ValueError(f"Expected event shape (B,8,H,W), but got {tuple(event.shape)}")
+
+    if ev_flow_downsample > 1:
+        event = F.interpolate(
+            event,
+            scale_factor=1 / ev_flow_downsample,
+            mode="bilinear",
+            align_corners=False,
+        )
+
+    pairs = [
+        (0, 1),
+        (1, 2),
+        (2, 3),
+        (5, 4),
+        (6, 5),
+        (7, 6),
+    ]
+    flow_list = []
+    for src, tgt in pairs:
+        flow_list.append(
+            _feature_flow_costvolume(
+                event[:, tgt:tgt + 1, :, :],
+                event[:, src:src + 1, :, :],
+                radius=radius,
+                inner_radius=inner_radius,
+                temperature=temperature,
+            )
+        )
+
+    flow = torch.stack(flow_list, dim=1)
+    b, num_pairs, pair_channels, h, w = flow.shape
+    flow_feat = flow.reshape(b, num_pairs * pair_channels, h, w)
+    if ev_flow_downsample > 1:
+        flow_feat = F.interpolate(
+            flow_feat,
+            scale_factor=ev_flow_downsample,
+            mode="bilinear",
+            align_corners=False,
+        )
+    return ev_flow_stem(flow_feat)
+
 
 class ResidualBlock(nn.Module):
     def __init__(self, feats, distillation_rate=0.5):
@@ -72,6 +143,23 @@ class ResidualBlock(nn.Module):
         out_fused = self.after_refine(out_fused)
         return out_fused
 
+
+class SEBlock(nn.Module):
+    def __init__(self, channels: int, reduction: int = 4):
+        super(SEBlock, self).__init__()
+        hidden = max(channels // reduction, 1)
+        self.net = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, hidden, 1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, channels, 1, bias=True),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
 class _Memory_Block_prompt(nn.Module):
     def __init__(self, hdim, kdim, moving_average_rate=0.999):
         super().__init__()
@@ -80,8 +168,7 @@ class _Memory_Block_prompt(nn.Module):
         self.moving_average_rate = moving_average_rate
         self.register_buffer("units", torch.randn(kdim, hdim))
         self.prompts = nn.Parameter(torch.rand(kdim, hdim), requires_grad=True)
-        self.training = True
-
+        self.training=True
     def update(self, x, score):
         m = self.units
         x = x.detach()
@@ -99,25 +186,30 @@ class _Memory_Block_prompt(nn.Module):
                 self.units.copy_(new_data)
         return self.units
 
-    def forward(self, x, update_flag=True):
+    def forward(self, x, y, update_flag=True):
         b, c, h, w = x.size()
         assert c == self.c
-        x = x.permute(0, 2, 3, 1).reshape(-1, c)
+        x_flat = x.permute(0, 2, 3, 1).reshape(-1, c)
+        event = y.permute(0, 2, 3, 1).reshape(-1, y.shape[1])
 
         m = self.units
         p = self.prompts
-        xn = F.normalize(x, dim=1)
+        xn = F.normalize(x_flat, dim=1)
         mn = F.normalize(m, dim=1)
         score = torch.matmul(xn, mn.t())
 
         if update_flag:
-            m = self.update(x, score)
+            m = self.update(x_flat, score)
             mn = F.normalize(m, dim=1)
             score = torch.matmul(xn, mn.t())
 
+        # if event.shape[1] != score.shape[1]:
+        #     event = event.mean(dim=1, keepdim=True)
+        score = score * event
         soft_label = F.softmax(score, dim=1)
-        out_m = torch.matmul(soft_label, m).view(b, h, w, c).permute(0, 3, 1, 2)
         out = torch.matmul(soft_label, p).view(b, h, w, c).permute(0, 3, 1, 2)
+        out_m = torch.matmul(soft_label, m).view(b, h, w, c).permute(0, 3, 1, 2)
+
         return out, out_m
 
 
@@ -163,10 +255,9 @@ class IG_MSA(nn.Module):
         self.rescale = nn.Parameter(torch.ones(heads, 1, 1))
         self.proj = nn.Linear(dim_head * heads, dim, bias=True)
 
-    def forward(self, x, var):
+    def forward(self, x):
         b, h, w, c = x.shape
         x = x.reshape(b, h * w, c)
-        var = var.reshape(b, h * w, c)
         q_inp = self.to_q(x)
         k_inp = self.to_k(x)
         v_inp = self.to_v(x)
@@ -231,8 +322,12 @@ class IG_MSA_memory(nn.Module):
         out_lr = self.proj((out_h + out_v) * 0.5)
         return out_lr
 
-    def forward(self, x, var):
-        z, z_m = self.momory_block(var.permute(0, 3, 1, 2), update_flag=self.training)
+    def forward(self, x, flow, event):
+        z, z_m = self.momory_block(
+            flow.permute(0, 3, 1, 2),
+            event.permute(0, 3, 1, 2),
+            update_flag=self.training,
+        )
         z = z.permute(0, 2, 3, 1)
         z_m = z_m.permute(0, 2, 3, 1)
 
@@ -260,80 +355,21 @@ class UPT(nn.Module):
         super().__init__()
         self.blocks = nn.ModuleList([])
         for _ in range(num_blocks):
-            self.blocks.append(
-                nn.ModuleList(
-                    [IG_MSA_memory(dim=dim, dim_head=dim_head, heads=heads), PreNorm(dim, FeedForward(dim=dim))]
-                )
-            )
-            self.blocks.append(
-                nn.ModuleList([IG_MSA(dim=dim, dim_head=dim_head, heads=heads), PreNorm(dim, FeedForward(dim=dim))])
-            )
+            self.blocks.append(nn.ModuleList([IG_MSA_memory(dim=dim, dim_head=dim_head, heads=heads), PreNorm(dim, FeedForward(dim=dim))]))
+            self.blocks.append(nn.ModuleList([IG_MSA(dim=dim, dim_head=dim_head, heads=heads), PreNorm(dim, FeedForward(dim=dim))]))
 
-    def forward(self, x, var):
+    def forward(self, x, flow, event):
         x = x.permute(0, 2, 3, 1)
-        var = var.permute(0, 2, 3, 1)
-        scoremap = None
-        for i, (attn, ff) in enumerate(self.blocks):
-            if i == 0:
-                x_ = attn(x, var)
-                x = x_ + x
+        flow = flow.permute(0, 2, 3, 1)
+        event = event.permute(0, 2, 3, 1)
+        for attn, ff in self.blocks:
+            if isinstance(attn, IG_MSA_memory):
+                x = attn(x, flow, event) + x
             else:
-                x = attn(x, var) + x
+                x = attn(x) + x
             x = ff(x) + x
         out = x.permute(0, 3, 1, 2)
-        return out, scoremap
-
-
-class EventGuidedVarFusion(nn.Module):
-    def __init__(self, channels, max_disp=1):
-        super().__init__()
-        self.max_disp = max_disp
-        hidden = max(channels // 4, 8)
-        self.channel_attn = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(channels * 2, hidden, kernel_size=1, bias=True),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(hidden, channels, kernel_size=1, bias=True),
-            nn.Sigmoid(),
-        )
-
-    def _cost_volume_flow(self, image_feat, event_feat):
-        disps = []
-        costs = []
-        for dy in range(-self.max_disp, self.max_disp + 1):
-            for dx in range(-self.max_disp, self.max_disp + 1):
-                shifted = torch.roll(event_feat, shifts=(dy, dx), dims=(2, 3))
-                cost = (image_feat * shifted).mean(dim=1, keepdim=True)
-                costs.append(cost)
-                disps.append((dx, dy))
-
-        cost_volume = torch.cat(costs, dim=1)
-        prob = F.softmax(cost_volume, dim=1)
-        disp = image_feat.new_tensor(disps).view(1, -1, 2, 1, 1)
-        flow_x = (prob * disp[:, :, 0]).sum(dim=1, keepdim=True)
-        flow_y = (prob * disp[:, :, 1]).sum(dim=1, keepdim=True)
-        return torch.cat([flow_x, flow_y], dim=1)
-
-    def _warp(self, feat, flow):
-        b, _, h, w = feat.shape
-        yy, xx = torch.meshgrid(
-            torch.arange(h, device=feat.device, dtype=feat.dtype),
-            torch.arange(w, device=feat.device, dtype=feat.dtype),
-        )
-        base_grid = torch.stack((xx, yy), dim=-1).unsqueeze(0).expand(b, -1, -1, -1)
-        grid = base_grid + flow.permute(0, 2, 3, 1)
-        grid_x = 2.0 * grid[..., 0] / max(w - 1, 1) - 1.0
-        grid_y = 2.0 * grid[..., 1] / max(h - 1, 1) - 1.0
-        norm_grid = torch.stack((grid_x, grid_y), dim=-1)
-        return F.grid_sample(feat, norm_grid, mode="bilinear", padding_mode="border", align_corners=True)
-
-    def forward(self, image_feat, event_feat):
-        event_feat = F.interpolate(event_feat, size=image_feat.shape[-2:], mode="bilinear", align_corners=False)
-        flow = self._cost_volume_flow(image_feat, event_feat)
-        warped_event = self._warp(event_feat, flow)
-        attn = self.channel_attn(torch.cat([image_feat, warped_event], dim=1))
-        return image_feat + attn * warped_event
-
+        return out
 
 class ChannelLayerNorm(nn.Module):
     def __init__(self, dim, eps=1e-6):
@@ -433,30 +469,28 @@ class WCFESpatialWaveletFilter(nn.Module):
     def __init__(self, dim: int, bias: bool = True):
         super(WCFESpatialWaveletFilter, self).__init__()
         self.g_ll = nn.Sequential(nn.Conv2d(dim, dim, 1, bias=bias), nn.Sigmoid())
-        # LL context를 concat하므로 입력 채널 dim*2
-        self.g_lh = nn.Sequential(nn.Conv2d(dim * 2, dim, 1, bias=bias), nn.Sigmoid())
-        self.g_hl = nn.Sequential(nn.Conv2d(dim * 2, dim, 1, bias=bias), nn.Sigmoid())
-        self.g_hh = nn.Sequential(nn.Conv2d(dim * 2, dim, 1, bias=bias), nn.Sigmoid())
+        self.g_lh = nn.Sequential(nn.Conv2d(dim, dim, 1, bias=bias), nn.Sigmoid())
+        self.g_hl = nn.Sequential(nn.Conv2d(dim, dim, 1, bias=bias), nn.Sigmoid())
+        self.g_hh = nn.Sequential(nn.Conv2d(dim, dim, 1, bias=bias), nn.Sigmoid())
 
     def forward(self, blur_4d: torch.Tensor, corr_4d: torch.Tensor) -> torch.Tensor:
         b_ll, b_lh, b_hl, b_hh, pad_h, pad_w = _haar_dwt2(blur_4d)
         c_ll, c_lh, c_hl, c_hh, _, _ = _haar_dwt2(corr_4d)
-
-        ll_gate = self.g_ll(c_ll)
-        f_ll = b_ll * ll_gate
-
-    
-        f_lh = b_lh * self.g_lh(torch.cat([c_lh, c_ll], dim=1))
-        f_hl = b_hl * self.g_hl(torch.cat([c_hl, c_ll], dim=1))
-        f_hh = b_hh * self.g_hh(torch.cat([c_hh, c_ll], dim=1))
+        
+        f_ll = b_ll * self.g_ll(c_ll)
+        f_lh = b_lh * self.g_lh(c_lh)
+        f_hl = b_hl * self.g_hl(c_hl)
+        f_hh = b_hh * self.g_hh(c_hh)
 
         return _haar_iwt2(f_ll, f_lh, f_hl, f_hh, pad_h, pad_w)
+
 
 class WCFEWaveletChannelGate(nn.Module):
     def __init__(
         self,
         dim: int,
         bias: bool = True,
+        reduction: int = 4,
     ):
         super(WCFEWaveletChannelGate, self).__init__()
         self.dim = dim
@@ -480,6 +514,7 @@ class WCFEWaveletChannelGate(nn.Module):
             nn.Sigmoid(),
         )
         self.post_reduce = nn.Conv2d(self.m * 2, self.m, 1, 1, 0, bias=True)
+        self.post_attn = SEBlock(self.m, reduction=reduction)
         self.post_refine = nn.Conv2d(self.m, self.m, 3, 1, 1, bias=True)
 
     def forward(self, blur: torch.Tensor, corr: torch.Tensor, spatial: torch.Tensor) -> torch.Tensor:
@@ -542,13 +577,13 @@ class WCFEBlock(nn.Module):
 __all__ = [
     "SAM",
     "UPT",
-    "EventGuidedVarFusion",
-    "EventGuidedGlobalAttentionFusion",
     "WCFEBlock",
     "WCFEWaveletChannelGate",
     "WCFESpatialWaveletFilter",
     "ChannelLayerNorm",
     "GEGLUFFN2D",
     "conv3x3",
-    "ResidualBlock"
+    "ResidualBlock",
+    "scer_to_voxel_general",
+    "_build_symmetric_ev_flow_feature",
 ]
