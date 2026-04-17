@@ -68,9 +68,8 @@ network_g:
   fuse_before_downsample: true
   relu_slope: 0.2
   num_heads: [1, 2, 4]
-  var_fusion_max_disp: 1
+  var_fusion_max_disp: 3
   var_fusion_num_heads: 4
-  var_fusion_kv_downsample: 4
 
 # path
 path:
@@ -123,6 +122,11 @@ val:
 
     ssim:
       type: calculate_ssim
+      crop_border: 0
+      test_y_channel: false
+
+    lpips:
+      type: calculate_lpips
       crop_border: 0
       test_y_channel: false
 
