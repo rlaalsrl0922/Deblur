@@ -473,9 +473,9 @@ class WCFESpatialWaveletFilter(nn.Module):
         self.g_hl = nn.Sequential(nn.Conv2d(dim, dim, 1, bias=bias), nn.Sigmoid())
         self.g_hh = nn.Sequential(nn.Conv2d(dim, dim, 1, bias=bias), nn.Sigmoid())
 
-    def forward(self, blur_4d: torch.Tensor, corr_4d: torch.Tensor) -> torch.Tensor:
-        b_ll, b_lh, b_hl, b_hh, pad_h, pad_w = _haar_dwt2(blur_4d)
-        c_ll, c_lh, c_hl, c_hh, _, _ = _haar_dwt2(corr_4d)
+    def forward(self, blur: torch.Tensor, event: torch.Tensor) -> torch.Tensor:
+        b_ll, b_lh, b_hl, b_hh, pad_h, pad_w = _haar_dwt2(blur)
+        c_ll, c_lh, c_hl, c_hh, _, _ = _haar_dwt2(event)
         
         f_ll = b_ll * self.g_ll(c_ll)
         f_lh = b_lh * self.g_lh(c_lh)
@@ -517,8 +517,8 @@ class WCFEWaveletChannelGate(nn.Module):
         self.post_attn = SEBlock(self.m, reduction=reduction)
         self.post_refine = nn.Conv2d(self.m, self.m, 3, 1, 1, bias=True)
 
-    def forward(self, blur: torch.Tensor, corr: torch.Tensor, spatial: torch.Tensor) -> torch.Tensor:
-        guide_src = corr + spatial
+    def forward(self, blur: torch.Tensor, event: torch.Tensor, spatial: torch.Tensor) -> torch.Tensor:
+        guide_src = event + spatial
         b_low, b_high, pad = _haar_dwt1_channel(blur)
         g_low, g_high, _ = _haar_dwt1_channel(guide_src)
 
@@ -535,6 +535,7 @@ class WCFEWaveletChannelGate(nn.Module):
             out_m=self.m,
         )
         out_m = self.post_reduce(torch.cat([gated_m, blur], dim=1))
+        out_m = out_m * self.post_attn(out_m)
         out_m = self.post_refine(out_m)
         return out_m
 
@@ -557,19 +558,25 @@ class WCFEBlock(nn.Module):
         self.ffn_norm = ChannelLayerNorm(dim)
         self.ffn = GEGLUFFN2D(dim=dim, expansion=ffn_expansion, bias=bias)
 
-    def forward(self, blur_feat, event_feat):
-        blur_n = self.norm_blur(blur_feat)
+    def forward(self, blur_feat: torch.Tensor, event_feat: torch.Tensor) -> torch.Tensor:
+        if blur_feat.shape != event_feat.shape:
+            raise ValueError("blur_feat and event_feat must have the same shape.")
+        if blur_feat.dim() == 5 and blur_feat.shape[1] != self.num_frames:
+            raise ValueError("Input T must match WCFEBlock(num_frames=...).")
+        if blur_feat.dim() not in (4, 5):
+            raise ValueError("Input must be 4D or 5D.")
+
         event_n = self.norm_event(event_feat)
-        
-        
-        spatial = self.spatial_filter(blur_feat, event)
-        channel = self.channel_gate(blur_feat, event, spatial)
-        
-        attn_q = self.attn_norm_q(blur_feat)
-        attn_kv = self.attn_norm_kv(event_feat)
-        attn = self.cross_attn(attn_q, attn_kv)
+        blur4, b, t = _flatten_bt(blur_feat)
+        event4, _, _ = _flatten_bt(event_n)
+
+        spatial4 = self.spatial_filter(blur4, event4)
+
+        spatial = _unflatten_bt(spatial4, b, t)
+        channel = self.channel_gate(blur_feat, event_n, spatial)
+
         x = blur_feat + spatial + channel
-        x = x + attn
+        x = x + self.cross_attn(self.attn_norm_q(blur_feat), self.attn_norm_kv(event_feat))
         x = x + self.ffn(self.ffn_norm(x))
         return x
 
