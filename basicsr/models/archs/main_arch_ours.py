@@ -8,7 +8,9 @@ from einops import rearrange
 from torch.nn.utils import weight_norm
 
 from basicsr.models.archs.arch_util_ours import (
+    MixBlock,
     Mutual_Attention,
+    ResBlock,
     SAM,
     conv,
     conv3x3,
@@ -114,9 +116,9 @@ def _build_symmetric_ev_flow_feature(
     return ev_flow_stem(flow_feat)
 
 
-class ResidualBlock(nn.Module):
+class ChannelRefineBlock(nn.Module):
     def __init__(self, feats, distillation_rate=0.5):
-        super(ResidualBlock, self).__init__()
+        super(ChannelRefineBlock, self).__init__()
         self.distilled_channels = int(feats // 2 * distillation_rate)
         self.remaining_channels = int(feats // 2 - self.distilled_channels)
         self.before_refine = nn.Conv2d(feats, feats, 1, 1, 0)
@@ -148,13 +150,7 @@ class SEBlock(nn.Module):
     def __init__(self, channels: int, reduction: int = 4):
         super(SEBlock, self).__init__()
         hidden = max(channels // reduction, 1)
-        self.net = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(channels, hidden, 1, bias=True),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(hidden, channels, 1, bias=True),
-            nn.Sigmoid(),
-        )
+        self.net = nn.Sequential(nn.AdaptiveAvgPool2d(1), MixBlock(channels, out_channels=channels, hidden_channels=hidden))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
@@ -223,9 +219,9 @@ class FeedForward(nn.Module):
         super().__init__()
         self.net = nn.Sequential(
             nn.Conv2d(dim, dim * mult, 1, 1, bias=False),
-            GELU(),
+            nn.LeakyReLU(0.2, inplace=False),
             nn.Conv2d(dim * mult, dim * mult, 3, 1, 1, bias=False, groups=dim * mult),
-            GELU(),
+            nn.LeakyReLU(0.2, inplace=False),
             nn.Conv2d(dim * mult, dim, 1, 1, bias=False),
         )
 
@@ -286,12 +282,7 @@ class IG_MSA_memory(nn.Module):
         self.proj = nn.Linear(dim_head * heads, dim, bias=True)
         self.down = nn.Conv2d(dim, dim, kernel_size=down_kernel, stride=2, padding=down_kernel // 2, bias=False)
         self.up = nn.ConvTranspose2d(dim, dim, kernel_size=2, stride=2, bias=False)
-        self.refine = nn.Sequential(
-            nn.Conv2d(dim, dim, 3, 1, 1, bias=False),
-            refine_act(inplace=True),
-            nn.Conv2d(dim, dim, 3, 1, 1, bias=False),
-            refine_act(inplace=True),
-        )
+        self.refine = ResBlock(dim, dim, negative_slope=0.2, bias=False)
         self.training = True
 
     def dual_prompt_attention_lowres(self, x_lr_bhwc, z_lr_bhwc, z_m_lr_bhwc):
@@ -468,14 +459,14 @@ def _haar_iwt1_channel(low, high, pad, out_m):
 class WCFESpatialWaveletFilter(nn.Module):
     def __init__(self, dim: int, bias: bool = True):
         super(WCFESpatialWaveletFilter, self).__init__()
-        self.g_ll = nn.Sequential(nn.Conv2d(dim, dim, 1, bias=bias), nn.Sigmoid())
-        self.g_lh = nn.Sequential(nn.Conv2d(dim, dim, 1, bias=bias), nn.Sigmoid())
-        self.g_hl = nn.Sequential(nn.Conv2d(dim, dim, 1, bias=bias), nn.Sigmoid())
-        self.g_hh = nn.Sequential(nn.Conv2d(dim, dim, 1, bias=bias), nn.Sigmoid())
+        self.g_ll = MixBlock(dim, out_channels=dim, bias=bias)
+        self.g_lh = MixBlock(dim, out_channels=dim, bias=bias)
+        self.g_hl = MixBlock(dim, out_channels=dim, bias=bias)
+        self.g_hh = MixBlock(dim, out_channels=dim, bias=bias)
 
-    def forward(self, blur: torch.Tensor, event: torch.Tensor) -> torch.Tensor:
-        b_ll, b_lh, b_hl, b_hh, pad_h, pad_w = _haar_dwt2(blur)
-        c_ll, c_lh, c_hl, c_hh, _, _ = _haar_dwt2(event)
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        b_ll, b_lh, b_hl, b_hh, pad_h, pad_w = _haar_dwt2(x)
+        c_ll, c_lh, c_hl, c_hh, _, _ = _haar_dwt2(y)
         
         f_ll = b_ll * self.g_ll(c_ll)
         f_lh = b_lh * self.g_lh(c_lh)
@@ -504,22 +495,17 @@ class WCFEWaveletChannelGate(nn.Module):
             nn.Sigmoid(),
         )
         self.high_refine = nn.Sequential(
-            ResidualBlock(feats=half),
+            ChannelRefineBlock(feats=half),
             nn.Conv2d(half, half, 3, 1, 1, bias=bias),
         )
-        self.g_high = nn.Sequential(
-            nn.Conv2d(half * 2, half, 1, bias=bias),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(half, half, 1, bias=bias),
-            nn.Sigmoid(),
-        )
+        self.g_high = MixBlock(half * 2, out_channels=half, hidden_channels=half, bias=bias)
         self.post_reduce = nn.Conv2d(self.m * 2, self.m, 1, 1, 0, bias=True)
         self.post_attn = SEBlock(self.m, reduction=reduction)
         self.post_refine = nn.Conv2d(self.m, self.m, 3, 1, 1, bias=True)
 
-    def forward(self, blur: torch.Tensor, event: torch.Tensor, spatial: torch.Tensor) -> torch.Tensor:
-        guide_src = event + spatial
-        b_low, b_high, pad = _haar_dwt1_channel(blur)
+    def forward(self, x: torch.Tensor, y: torch.Tensor, spatial: torch.Tensor) -> torch.Tensor:
+        guide_src = y + spatial
+        b_low, b_high, pad = _haar_dwt1_channel(x)
         g_low, g_high, _ = _haar_dwt1_channel(guide_src)
 
         low_out = b_low * self.g_low(torch.cat([b_low, g_low], dim=1))
@@ -534,7 +520,7 @@ class WCFEWaveletChannelGate(nn.Module):
             pad=pad,
             out_m=self.m,
         )
-        out_m = self.post_reduce(torch.cat([gated_m, blur], dim=1))
+        out_m = self.post_reduce(torch.cat([gated_m, x], dim=1))
         out_m = out_m * self.post_attn(out_m)
         out_m = self.post_refine(out_m)
         return out_m
@@ -545,7 +531,6 @@ class WCFEBlock(nn.Module):
         super(WCFEBlock, self).__init__()
         self.dim = dim
 
-        self.norm_blur = ChannelLayerNorm(dim)
         self.norm_event = ChannelLayerNorm(dim)
 
         self.spatial_filter = WCFESpatialWaveletFilter(dim=dim, bias=bias)
@@ -558,27 +543,15 @@ class WCFEBlock(nn.Module):
         self.ffn_norm = ChannelLayerNorm(dim)
         self.ffn = GEGLUFFN2D(dim=dim, expansion=ffn_expansion, bias=bias)
 
-    def forward(self, blur_feat: torch.Tensor, event_feat: torch.Tensor) -> torch.Tensor:
-        if blur_feat.shape != event_feat.shape:
-            raise ValueError("blur_feat and event_feat must have the same shape.")
-        if blur_feat.dim() == 5 and blur_feat.shape[1] != self.num_frames:
-            raise ValueError("Input T must match WCFEBlock(num_frames=...).")
-        if blur_feat.dim() not in (4, 5):
-            raise ValueError("Input must be 4D or 5D.")
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        y_n = self.norm_event(y)
+        spatial = self.spatial_filter(x, y_n)
+        channel = self.channel_gate(x, y_n, spatial)
 
-        event_n = self.norm_event(event_feat)
-        blur4, b, t = _flatten_bt(blur_feat)
-        event4, _, _ = _flatten_bt(event_n)
-
-        spatial4 = self.spatial_filter(blur4, event4)
-
-        spatial = _unflatten_bt(spatial4, b, t)
-        channel = self.channel_gate(blur_feat, event_n, spatial)
-
-        x = blur_feat + spatial + channel
-        x = x + self.cross_attn(self.attn_norm_q(blur_feat), self.attn_norm_kv(event_feat))
-        x = x + self.ffn(self.ffn_norm(x))
-        return x
+        out = x + spatial + channel
+        out = out + self.cross_attn(self.attn_norm_q(x), self.attn_norm_kv(y))
+        out = out + self.ffn(self.ffn_norm(out))
+        return out
 
 
 __all__ = [
@@ -587,10 +560,10 @@ __all__ = [
     "WCFEBlock",
     "WCFEWaveletChannelGate",
     "WCFESpatialWaveletFilter",
+    "ChannelRefineBlock",
     "ChannelLayerNorm",
     "GEGLUFFN2D",
     "conv3x3",
-    "ResidualBlock",
     "scer_to_voxel_general",
     "_build_symmetric_ev_flow_feature",
 ]

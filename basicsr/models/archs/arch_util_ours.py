@@ -26,6 +26,37 @@ def conv(in_channels, out_channels, kernel_size, bias=False, stride=1):
         stride=stride,
     )
 
+
+class ResBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, negative_slope=0.2, bias=True):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=bias)
+        self.act1 = nn.LeakyReLU(negative_slope, inplace=False)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=bias)
+        self.act2 = nn.LeakyReLU(negative_slope, inplace=False)
+
+    def forward(self, x):
+        out = self.act1(self.conv1(x))
+        out = self.act2(self.conv2(out))
+        return out
+
+
+class MixBlock(nn.Module):
+    def __init__(self, in_channels, out_channels=None, hidden_channels=None, negative_slope=0.2, bias=True):
+        super().__init__()
+        out_channels = out_channels or in_channels
+        hidden_channels = hidden_channels or out_channels
+        self.net = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_channels, kernel_size=1, stride=1, padding=0, bias=bias),
+            nn.LeakyReLU(negative_slope, inplace=False),
+            nn.Conv2d(hidden_channels, out_channels, kernel_size=1, stride=1, padding=0, bias=bias),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
 class SAM(nn.Module):
     def __init__(self, n_feat, kernel_size=3, bias=True):
         super(SAM, self).__init__()

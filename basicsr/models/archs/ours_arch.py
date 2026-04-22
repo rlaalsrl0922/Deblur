@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 
 from basicsr.models.archs.main_arch_ours import (
-    ResidualBlock,
+    ChannelRefineBlock,
     UPT,
     WCFEBlock,
     _build_symmetric_ev_flow_feature,
@@ -10,6 +10,7 @@ from basicsr.models.archs.main_arch_ours import (
 )
 from basicsr.models.archs.arch_util_ours import (
     EventImage_ChannelAttentionTransformerBlock,
+    ResBlock,
     SAM,
     conv_down,
     conv3x3,
@@ -33,7 +34,6 @@ class EFNetOurs(nn.Module):
         self.depth = depth
         self.fuse_before_downsample = fuse_before_downsample
         self.num_heads = num_heads
-        self.var_fusion_type = var_fusion_type
         self.var_fusion_max_disp = var_fusion_max_disp
         self.var_fusion_num_heads = var_fusion_num_heads
         self.var_fusion_inner_radius = var_fusion_inner_radius
@@ -48,12 +48,7 @@ class EFNetOurs(nn.Module):
 
         self.down_path_ev = nn.ModuleList()
         self.down_path_ev_flow = nn.ModuleList()
-        self.ev_flow_stem = nn.Sequential(
-            nn.Conv2d(self.ev_flow_channels,self.ev_flow_channels,3,1,1,groups=self.ev_flow_channels // 2,bias=True,),
-            nn.LeakyReLU(relu_slope, inplace=False),
-            nn.Conv2d(self.ev_flow_channels, self.ev_flow_channels, 3, 1, 1, bias=True),
-            nn.LeakyReLU(relu_slope, inplace=False),
-        )
+        self.ev_flow_stem = ResBlock(self.ev_flow_channels, self.ev_flow_channels, negative_slope=0.2)
 
         prev_channels = self.get_input_chn(wf)
         ev_flow_prev_channels = self.ev_flow_channels
@@ -226,19 +221,13 @@ class UNetConvBlock(nn.Module):
         use_wcfe=None,
     ):
         super(UNetConvBlock, self).__init__()
-        self.downsample = downsample
-        self.identity = nn.Conv2d(in_size, out_size, 1, 1, 0)
+        self.downsample = conv_down(out_size, out_size, bias=False) if downsample else None
         self.num_heads = num_heads
         self.use_wcfe = use_wcfe
 
-        self.conv_1 = nn.Conv2d(in_size, out_size, kernel_size=3, padding=1, bias=True)
-        self.relu_1 = nn.LeakyReLU(relu_slope, inplace=False)
-        self.conv_2 = nn.Conv2d(out_size, out_size, kernel_size=3, padding=1, bias=True)
-        self.relu_2 = nn.LeakyReLU(relu_slope, inplace=False)
-        self.slb = ResidualBlock(feats=out_size)
-
-        if downsample:
-            self.downsample = conv_down(out_size, out_size, bias=False)
+        self.identity = nn.Conv2d(in_size, out_size, 1, 1, 0)
+        self.res_block = ResBlock(in_size, out_size, negative_slope=relu_slope)
+        self.slb = ChannelRefineBlock(feats=out_size)
 
         if self.num_heads is not None:
             self.image_event_transformer = EventImage_ChannelAttentionTransformerBlock(
@@ -258,10 +247,7 @@ class UNetConvBlock(nn.Module):
             )
 
     def forward(self, x, enc=None, event_filter=None, merge_before_downsample=True):
-        out = self.conv_1(x)
-        out_conv1 = self.relu_1(out)
-        out_conv2 = self.relu_2(self.conv_2(out_conv1))
-        out = out_conv2 + self.identity(x)
+        out = self.res_block(x) + self.identity(x)
         out = self.slb(out) + out
 
         if self.num_heads is not None:
@@ -269,7 +255,7 @@ class UNetConvBlock(nn.Module):
         if self.use_wcfe is not None:
             out = self.image_event_wcfe(out, event_filter)
 
-        if self.downsample:
+        if self.downsample is not None:
             out_down = self.downsample(out)
             if not merge_before_downsample:
                 out_down = self.image_event_transformer(out_down, event_filter)
@@ -287,25 +273,15 @@ class UNetConvBlock(nn.Module):
 class UNetEVConvBlock(nn.Module):
     def __init__(self, in_size, out_size, downsample, relu_slope):
         super(UNetEVConvBlock, self).__init__()
-        self.downsample = downsample
+        self.downsample = conv_down(out_size, out_size, bias=False) if downsample else None
         self.identity = nn.Conv2d(in_size, out_size, 1, 1, 0)
-
-        self.conv_1 = nn.Conv2d(in_size, out_size, kernel_size=3, padding=1, bias=True)
-        self.relu_1 = nn.LeakyReLU(relu_slope, inplace=False)
-        self.conv_2 = nn.Conv2d(out_size, out_size, kernel_size=3, padding=1, bias=True)
-        self.relu_2 = nn.LeakyReLU(relu_slope, inplace=False)
+        self.res_block = ResBlock(in_size, out_size, negative_slope=relu_slope)
         self.conv_before_merge = nn.Conv2d(out_size, out_size, 1, 1, 0)
 
-        if downsample:
-            self.downsample = conv_down(out_size, out_size, bias=False)
-
     def forward(self, x, merge_before_downsample=True):
-        out = self.conv_1(x)
-        out_conv1 = self.relu_1(out)
-        out_conv2 = self.relu_2(self.conv_2(out_conv1))
-        out = out_conv2 + self.identity(x)
+        out = self.res_block(x) + self.identity(x)
 
-        if self.downsample:
+        if self.downsample is not None:
             out_down = self.downsample(out)
             if not merge_before_downsample:
                 out_down = self.conv_before_merge(out_down)
