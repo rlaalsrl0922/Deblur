@@ -46,7 +46,8 @@ class EFNetOurs(nn.Module):
         self.conv_ev1 = nn.Conv2d(ev_chn, wf, 3, 1, 1)
         
         self.down_path_ev_flow = nn.ModuleList()
-        self.ev_flow_downsample = 2 ** max(self.depth - 1, 0)
+        self.ev_flow_depth = max(self.depth - 1, 0)
+        self.ev_flow_downsample = 2 ** max(self.ev_flow_depth - 1, 0)
         self.ev_flow_channels = (ev_chn-2) * 2
         self.conv_ev_flow1 = nn.Conv2d(ev_flow_channels, wf, 3, 1, 1)
         self.ev_flow_stem = ResBlock(self.ev_flow_channels, self.ev_flow_channels, negative_slope=0.2)
@@ -55,6 +56,7 @@ class EFNetOurs(nn.Module):
         ev_flow_prev_channels = self.ev_flow_channels
         for i in range(depth):
             downsample = True if (i+1) < depth else False 
+            ev_flow_downsample = True if (i+1) < self.ev_flow_depth else False
             stage_channels = (2**i) * wf
 
             self.down_path_1.append(
@@ -76,9 +78,9 @@ class EFNetOurs(nn.Module):
                 )
             )
             # ev encoder
-            if i < self.depth:
-                self.down_path_ev.append(UNetEVConvBlock(prev_channels, stage_channels, downsample , relu_slope))
-                self.down_path_ev_flow.append(UNetEVConvBlock(ev_flow_prev_channels,stage_channels,downsample,relu_slope,))
+            self.down_path_ev.append(UNetEVConvBlock(prev_channels, stage_channels, downsample , relu_slope))
+            if i < self.ev_flow_depth:
+                self.down_path_ev_flow.append(UNetEVConvBlock(ev_flow_prev_channels,stage_channels,ev_flow_downsample,relu_slope,))
                 ev_flow_prev_channels = stage_channels
 
             prev_channels = stage_channels
@@ -133,7 +135,7 @@ class EFNetOurs(nn.Module):
         flow_feat = _build_symmetric_ev_flow_feature(event,self.ev_flow_stem,self.ev_flow_downsample,radius=self.var_fusion_max_disp,inner_radius=self.var_fusion_inner_radius,temperature=0.1)
         flow_feat = self.conv_ev_flow1(flow_feat)
         for i, down in enumerate(self.down_path_ev_flow):
-            if i < self.depth - 1:
+            if i < self.ev_flow_depth - 1:
                 flow_feat, flow_feat_up = down(flow_feat, self.fuse_before_downsample)
                 ev_flow.append(flow_feat_up if self.fuse_before_downsample else flow_feat)
             else:
