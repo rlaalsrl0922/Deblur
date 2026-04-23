@@ -41,13 +41,14 @@ class EFNetOurs(nn.Module):
         self.down_path_2 = nn.ModuleList()
         self.conv_01 = nn.Conv2d(in_chn, wf, 3, 1, 1)
         self.conv_02 = nn.Conv2d(in_chn, wf, 3, 1, 1)
+        
+        self.down_path_ev = nn.ModuleList()
         self.conv_ev1 = nn.Conv2d(ev_chn, wf, 3, 1, 1)
         
+        self.down_path_ev_flow = nn.ModuleList()
         self.ev_flow_downsample = 2 ** max(self.depth - 1, 0)
         self.ev_flow_channels = (ev_chn-2) * 2
-
-        self.down_path_ev = nn.ModuleList()
-        self.down_path_ev_flow = nn.ModuleList()
+        self.conv_ev_flow1 = nn.Conv2d(ev_flow_channels, wf, 3, 1, 1)
         self.ev_flow_stem = ResBlock(self.ev_flow_channels, self.ev_flow_channels, negative_slope=0.2)
 
         prev_channels = self.get_input_chn(wf)
@@ -130,6 +131,7 @@ class EFNetOurs(nn.Module):
 
         ev_flow = []
         flow_feat = _build_symmetric_ev_flow_feature(event,self.ev_flow_stem,self.ev_flow_downsample,radius=self.var_fusion_max_disp,inner_radius=self.var_fusion_inner_radius,temperature=0.1)
+        flow_feat = self.conv_ev_flow1(flow_feat)
         for i, down in enumerate(self.down_path_ev_flow):
             if i < self.depth - 1:
                 flow_feat, flow_feat_up = down(flow_feat, self.fuse_before_downsample)
