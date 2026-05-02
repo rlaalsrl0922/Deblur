@@ -176,7 +176,7 @@ class _Memory_Block_prompt(nn.Module):
         m = self.units
         x = x.detach()
         embed_ind = torch.max(score, dim=1)[1]
-        eembed_onehot = F.one_hot(embed_ind, self.k).type(x.dtype)
+        embed_onehot = F.one_hot(embed_ind, self.k).type(x.dtype)
         embed_onehot_sum = embed_onehot.sum(0)
         embed_sum = x.transpose(0, 1) @ embed_onehot
         embed_mean = embed_sum / (embed_onehot_sum + 1e-6)
