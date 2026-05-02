@@ -28,7 +28,7 @@ class EFNetOurs(nn.Module):
         num_heads=[1, 2, 4],
         var_fusion_max_disp=3,
         var_fusion_num_heads=4,
-        var_fusion_inner_radius=0
+        var_fusion_inner_radius=0,
     ):
         super(EFNetOurs, self).__init__()
         self.depth = depth
@@ -49,7 +49,7 @@ class EFNetOurs(nn.Module):
         self.ev_flow_depth = max(self.depth - 1, 0)
         self.ev_flow_downsample = 2 ** max(self.ev_flow_depth - 1, 0)
         self.ev_flow_channels = (ev_chn-2) * 2
-        self.conv_ev_flow1 = nn.Conv2d(ev_flow_channels, wf, 3, 1, 1)
+        self.conv_ev_flow1 = nn.Conv2d(self.ev_flow_channels, wf, 3, 1, 1)
         self.ev_flow_stem = ResBlock(self.ev_flow_channels, self.ev_flow_channels, negative_slope=0.2)
 
         prev_channels = self.get_input_chn(wf)
@@ -75,12 +75,14 @@ class EFNetOurs(nn.Module):
                     stage_channels,
                     downsample,
                     relu_slope,
+                    num_heads=self.num_heads[i],
+                    use_wcfe=self.num_heads[i],
                 )
             )
             # ev encoder
             self.down_path_ev.append(UNetEVConvBlock(prev_channels, stage_channels, downsample , relu_slope))
             if i < self.ev_flow_depth:
-                self.down_path_ev_flow.append(UNetEVConvBlock(ev_flow_prev_channels,stage_channels,ev_flow_downsample,relu_slope,))
+                self.down_path_ev_flow.append(UNetEVConvBlock(prev_channels, stage_channels, ev_flow_downsample, relu_slope,))
                 ev_flow_prev_channels = stage_channels
 
             prev_channels = stage_channels
@@ -129,7 +131,11 @@ class EFNetOurs(nn.Module):
 
         
         event = torch.cat((event[:, :4, :, :], event[:, 5:, :, :]), dim=1)
+        
         event = scer_to_voxel_general(event)
+        max_abs = event.abs().max()
+        if max_abs > 0:
+            event = event/ max_abs        
 
         ev_flow = []
         flow_feat = _build_symmetric_ev_flow_feature(event,self.ev_flow_stem,self.ev_flow_downsample,radius=self.var_fusion_max_disp,inner_radius=self.var_fusion_inner_radius,temperature=0.1)
@@ -171,7 +177,7 @@ class EFNetOurs(nn.Module):
             var_ev = self.var_ev_stage1[i](ev[ev_idx])
             var_ev_flow = self.var_flow_stage1[i](ev_flow[ev_idx])
             
-            x1 = self.up_path_1_memory[i](x1, var_ev, var_ev_flow)
+            x1 = self.up_path_1_memory[i](x1, var_ev_flow, var_ev)
 
         var_stage1 = self.last_var_head(x1)
         sam_feature, out_1 = self.sam12(x1, image)
@@ -256,21 +262,21 @@ class UNetConvBlock(nn.Module):
 
         if self.num_heads is not None:
             out = self.image_event_transformer(out, event_filter)
-        if self.use_wcfe is not None:
+        if self.use_wcfe:
             out = self.image_event_wcfe(out, event_filter)
 
         if self.downsample is not None:
             out_down = self.downsample(out)
             if not merge_before_downsample:
                 out_down = self.image_event_transformer(out_down, event_filter)
-                if self.use_wcfe is not None:
+                if self.use_wcfe:
                     out = self.image_event_wcfe(out, event_filter)
             return out_down, out
 
         if merge_before_downsample:
             return out
         out = self.image_event_transformer(out, event_filter)
-        if self.use_wcfe is not None:
+        if self.use_wcfe:
             out = self.image_event_wcfe(out, event_filter)
 
 
