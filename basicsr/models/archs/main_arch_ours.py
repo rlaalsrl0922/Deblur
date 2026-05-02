@@ -155,16 +155,17 @@ class SEBlock(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
 
-
 class _Memory_Block_prompt(nn.Module):
     def __init__(self, hdim, kdim, moving_average_rate=0.999):
         super().__init__()
         self.c = hdim
         self.k = kdim
         self.moving_average_rate = moving_average_rate
+        # EMA memory should be updated in-place, not re-registered as a Parameter.
         self.register_buffer("units", torch.randn(kdim, hdim))
         self.prompts = nn.Parameter(torch.rand(kdim, hdim), requires_grad=True)
         self.training=True
+        self.event_proj = nn.Conv2d(hdim, kdim,1,1,0)
     def update(self, x, score):
         m = self.units
         x = x.detach()
@@ -185,8 +186,11 @@ class _Memory_Block_prompt(nn.Module):
     def forward(self, x, y, update_flag=True):
         b, c, h, w = x.size()
         assert c == self.c
+
         x_flat = x.permute(0, 2, 3, 1).reshape(-1, c)
-        event = y.permute(0, 2, 3, 1).reshape(-1, y.shape[1])
+
+        event_weight = self.event_proj(y)
+        event_weight = event_weight.permute(0, 2, 3, 1).reshape(-1, self.k)
 
         m = self.units
         p = self.prompts
@@ -201,7 +205,8 @@ class _Memory_Block_prompt(nn.Module):
 
         # if event.shape[1] != score.shape[1]:
         #     event = event.mean(dim=1, keepdim=True)
-        score = score * event
+        score = score + event_weight
+        # score = score * event
         soft_label = F.softmax(score, dim=1)
         out = torch.matmul(soft_label, p).view(b, h, w, c).permute(0, 3, 1, 2)
         out_m = torch.matmul(soft_label, m).view(b, h, w, c).permute(0, 3, 1, 2)
@@ -548,8 +553,8 @@ class WCFEBlock(nn.Module):
         spatial = self.spatial_filter(x, y_n)
         channel = self.channel_gate(x, y_n, spatial)
 
-        out = x + spatial + channel
-        out = out + self.cross_attn(self.attn_norm_q(x), self.attn_norm_kv(y))
+        out = x + channel
+        out = out + self.cross_attn(self.attn_norm_q(y), self.attn_norm_kv(x))
         out = out + self.ffn(self.ffn_norm(out))
         return out
 
