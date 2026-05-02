@@ -92,7 +92,7 @@ class EFNetOurs(nn.Module):
         self.up_path_1_memory = nn.ModuleList()
         self.skip_conv_1 = nn.ModuleList()
         self.skip_conv_2 = nn.ModuleList()
-        self.var_ev_stage1 = nn.ModuleList()
+#         self.var_ev_stage1 = nn.ModuleList()
         self.var_flow_stage1 = nn.ModuleList()
         for i in reversed(range(depth - 1)):
             stage_channels = (2**i) * wf
@@ -101,12 +101,12 @@ class EFNetOurs(nn.Module):
             self.up_path_1_memory.append(UPT(dim=stage_channels, num_blocks=1, dim_head=stage_channels, heads=1))
             self.skip_conv_1.append(nn.Conv2d((2**i)*wf, (2**i)*wf, 3, 1, 1))
             self.skip_conv_2.append(nn.Conv2d((2**i)*wf, (2**i)*wf, 3, 1, 1))
-            self.var_ev_stage1.append(nn.Sequential(
-                nn.Conv2d(stage_channels, stage_channels, 3, 1, 1),
-                nn.ELU(),
-                nn.Conv2d(stage_channels, stage_channels, 3, 1, 1),
-                nn.ELU(),
-            ))
+#             self.var_ev_stage1.append(nn.Sequential(
+#                 nn.Conv2d(stage_channels, stage_channels, 3, 1, 1),
+#                 nn.ELU(),
+#                 nn.Conv2d(stage_channels, stage_channels, 3, 1, 1),
+#                 nn.ELU(),
+#             ))
             self.var_flow_stage1.append(nn.Sequential(
                 nn.Conv2d(stage_channels, stage_channels, 3, 1, 1),
                 nn.ELU(),
@@ -138,7 +138,7 @@ class EFNetOurs(nn.Module):
             event = event/ max_abs        
 
         ev_flow = []
-        flow_feat = _build_symmetric_ev_flow_feature(event,self.ev_flow_stem,self.ev_flow_downsample,radius=self.var_fusion_max_disp,inner_radius=self.var_fusion_inner_radius,temperature=0.1)
+        flow_feat, flow = _build_symmetric_ev_flow_feature(event,self.ev_flow_stem,self.ev_flow_downsample,radius=self.var_fusion_max_disp,inner_radius=self.var_fusion_inner_radius,temperature=0.1)
         flow_feat = self.conv_ev_flow1(flow_feat)
         for i, down in enumerate(self.down_path_ev_flow):
             if i < self.ev_flow_depth - 1:
@@ -174,10 +174,10 @@ class EFNetOurs(nn.Module):
             x1 = up(x1, self.skip_conv_1[i](encs[-i-1]))
             ev_idx = self.depth - i - 2
             
-            var_ev = self.var_ev_stage1[i](ev[ev_idx])
+#             var_ev = self.var_ev_stage1[i](ev[ev_idx])
             var_ev_flow = self.var_flow_stage1[i](ev_flow[ev_idx])
             
-            x1 = self.up_path_1_memory[i](x1, var_ev_flow, var_ev)
+            x1 = self.up_path_1_memory[i](x1, var_ev_flow, flow)
 
         var_stage1 = self.last_var_head(x1)
         sam_feature, out_1 = self.sam12(x1, image)
