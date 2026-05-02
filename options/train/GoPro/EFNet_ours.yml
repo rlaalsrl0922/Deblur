@@ -63,11 +63,11 @@ network_g:
   type: EFNetOurs
   in_chn: 3
   ev_chn: 8
-  wf: 64
-  depth: 3
+  wf: 128
+  depth: 4
   fuse_before_downsample: true
   relu_slope: 0.2
-  num_heads: [1, 2, 4]
+  num_heads: [4, 4, 4, 4]
   var_fusion_max_disp: 3
   var_fusion_num_heads: 4
 

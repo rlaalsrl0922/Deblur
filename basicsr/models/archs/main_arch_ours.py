@@ -162,12 +162,12 @@ class _Memory_Block_prompt(nn.Module):
         self.k = kdim
         self.moving_average_rate = moving_average_rate
         self.pool_kernel = pool_kernel
-        
+
         # EMA memory should be updated in-place, not re-registered as a Parameter.
         self.register_buffer("units", torch.randn(kdim, hdim))
         self.prompts = nn.Parameter(torch.rand(kdim, hdim), requires_grad=True)
         self.training=True
-#         self.event_proj = nn.Conv2d(hdim, kdim,1,1,0)
+
         self.motion_gate_proj = nn.Sequential(
             nn.Conv2d(6, hdim, 1, 1, 0),
             nn.Sigmoid()
@@ -176,7 +176,7 @@ class _Memory_Block_prompt(nn.Module):
         m = self.units
         x = x.detach()
         embed_ind = torch.max(score, dim=1)[1]
-        embed_onehot = F.one_hot(embed_ind, self.k).type(x.dtype)
+        eembed_onehot = F.one_hot(embed_ind, self.k).type(x.dtype)
         embed_onehot_sum = embed_onehot.sum(0)
         embed_sum = x.transpose(0, 1) @ embed_onehot
         embed_mean = embed_sum / (embed_onehot_sum + 1e-6)
@@ -193,8 +193,6 @@ class _Memory_Block_prompt(nn.Module):
         b, c, h, w = x.size()
         assert c == self.c
 
-#         event_weight = self.event_proj(y)
-#         event_weight = event_weight.permute(0, 2, 3, 1).reshape(-1, self.k)
         # motion magnitude map
         motion_mag = torch.norm(raw_flow, p=2, dim=2) # (B, 6, H, W)
         # local maximum motion magnitude
@@ -231,20 +229,12 @@ class _Memory_Block_prompt(nn.Module):
             mn = F.normalize(m, dim=1)
             score = torch.matmul(xn, mn.t())
 
-        # if event.shape[1] != score.shape[1]:
-        #     event = event.mean(dim=1, keepdim=True)
-#         score = score + event_weight
-        # score = score * event
         soft_label = F.softmax(score, dim=1)
         out = torch.matmul(soft_label, p).view(b, h, w, c).permute(0, 3, 1, 2)
         out_m = torch.matmul(soft_label, m).view(b, h, w, c).permute(0, 3, 1, 2)
-        
-        # motion-magnitude-aware prompt modulation
-#         print("Check shape::::", out.shape, raw_flow.shape, motion_gate.shape)
+
         out = out * (1.0 + motion_gate)
         out_m = out_m * (1.0 + motion_gate)
-
-
         return out, out_m
 
 
@@ -355,7 +345,6 @@ class IG_MSA_memory(nn.Module):
     def forward(self, x, flow, origin_flow):
         z, z_m = self.momory_block(
             flow.permute(0, 3, 1, 2),
-#             event.permute(0, 3, 1, 2),
             origin_flow,
             update_flag=self.training,
         )
@@ -392,7 +381,6 @@ class UPT(nn.Module):
     def forward(self, x, flow, origin_flow):
         x = x.permute(0, 2, 3, 1)
         flow = flow.permute(0, 2, 3, 1)
-#         event = event.permute(0, 2, 3, 1)
         for attn, ff in self.blocks:
             if isinstance(attn, IG_MSA_memory):
                 x = attn(x, flow, origin_flow) + x

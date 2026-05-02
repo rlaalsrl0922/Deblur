@@ -13,7 +13,6 @@ from basicsr.models.archs.arch_util_ours import (
     ResBlock,
     SAM,
     conv_down,
-    conv3x3,
 )
 
 class EFNetOurs(nn.Module):
@@ -38,9 +37,7 @@ class EFNetOurs(nn.Module):
         self.var_fusion_num_heads = var_fusion_num_heads
         self.var_fusion_inner_radius = var_fusion_inner_radius
         self.down_path_1 = nn.ModuleList()
-        self.down_path_2 = nn.ModuleList()
         self.conv_01 = nn.Conv2d(in_chn, wf, 3, 1, 1)
-        self.conv_02 = nn.Conv2d(in_chn, wf, 3, 1, 1)
         
         self.down_path_ev = nn.ModuleList()
         self.conv_ev1 = nn.Conv2d(ev_chn, wf, 3, 1, 1)
@@ -53,23 +50,12 @@ class EFNetOurs(nn.Module):
         self.ev_flow_stem = ResBlock(self.ev_flow_channels, self.ev_flow_channels, negative_slope=0.2)
 
         prev_channels = self.get_input_chn(wf)
-        ev_flow_prev_channels = self.ev_flow_channels
         for i in range(depth):
             downsample = True if (i+1) < depth else False 
             ev_flow_downsample = True if (i+1) < self.ev_flow_depth else False
-            stage_channels = (2**i) * wf
+            stage_channels = wf
 
             self.down_path_1.append(
-                UNetConvBlock(
-                    prev_channels,
-                    stage_channels,
-                    downsample,
-                    relu_slope,
-                    num_heads=self.num_heads[i],
-                    use_wcfe=self.num_heads[i],
-                )
-            )
-            self.down_path_2.append(
                 UNetConvBlock(
                     prev_channels,
                     stage_channels,
@@ -83,42 +69,35 @@ class EFNetOurs(nn.Module):
             self.down_path_ev.append(UNetEVConvBlock(prev_channels, stage_channels, downsample , relu_slope))
             if i < self.ev_flow_depth:
                 self.down_path_ev_flow.append(UNetEVConvBlock(prev_channels, stage_channels, ev_flow_downsample, relu_slope,))
-                ev_flow_prev_channels = stage_channels
 
             prev_channels = stage_channels
 
         self.up_path_1 = nn.ModuleList()
-        self.up_path_2 = nn.ModuleList()
         self.up_path_1_memory = nn.ModuleList()
         self.skip_conv_1 = nn.ModuleList()
-        self.skip_conv_2 = nn.ModuleList()
-#         self.var_ev_stage1 = nn.ModuleList()
         self.var_flow_stage1 = nn.ModuleList()
         for i in reversed(range(depth - 1)):
-            stage_channels = (2**i) * wf
-            self.up_path_1.append(UNetUpBlock(prev_channels, (2**i)*wf, relu_slope))
-            self.up_path_2.append(UNetUpBlock(prev_channels, (2**i)*wf, relu_slope))
+            stage_channels = wf
+            self.up_path_1.append(
+                UNetUpBlock(
+                    prev_channels,
+                    wf,
+                    relu_slope,
+                    num_heads=self.num_heads[i],
+                    use_wcfe=self.num_heads[i],
+                )
+            )
             self.up_path_1_memory.append(UPT(dim=stage_channels, num_blocks=1, dim_head=stage_channels, heads=1))
-            self.skip_conv_1.append(nn.Conv2d((2**i)*wf, (2**i)*wf, 3, 1, 1))
-            self.skip_conv_2.append(nn.Conv2d((2**i)*wf, (2**i)*wf, 3, 1, 1))
-#             self.var_ev_stage1.append(nn.Sequential(
-#                 nn.Conv2d(stage_channels, stage_channels, 3, 1, 1),
-#                 nn.ELU(),
-#                 nn.Conv2d(stage_channels, stage_channels, 3, 1, 1),
-#                 nn.ELU(),
-#             ))
+            self.skip_conv_1.append(nn.Conv2d(wf, wf, 3, 1, 1))
             self.var_flow_stage1.append(nn.Sequential(
                 nn.Conv2d(stage_channels, stage_channels, 3, 1, 1),
                 nn.ELU(),
                 nn.Conv2d(stage_channels, stage_channels, 3, 1, 1),
                 nn.ELU(),
             ))
-            prev_channels = (2**i)*wf
+            prev_channels = wf
             
         self.sam12 = SAM(prev_channels)
-
-        self.cat12 = nn.Conv2d(prev_channels*2, prev_channels, 1, 1, 0)
-        self.last = conv3x3(prev_channels, in_chn, bias=True)
 
         self.last_var_head = nn.Sequential(
             nn.Conv2d(prev_channels, prev_channels, 3, 1, 1),
@@ -129,13 +108,12 @@ class EFNetOurs(nn.Module):
     def forward(self, x, event, mask=None):
         image = x
 
-        
+        # Event preprocessing follows the downstream [B, 8, H, W] convention.
         event = torch.cat((event[:, :4, :, :], event[:, 5:, :, :]), dim=1)
-        
         event = scer_to_voxel_general(event)
         max_abs = event.abs().max()
         if max_abs > 0:
-            event = event/ max_abs        
+            event = event/ max_abs 
 
         ev_flow = []
         flow_feat, flow = _build_symmetric_ev_flow_feature(event,self.ev_flow_stem,self.ev_flow_downsample,radius=self.var_fusion_max_disp,inner_radius=self.var_fusion_inner_radius,temperature=0.1)
@@ -160,7 +138,6 @@ class EFNetOurs(nn.Module):
 
         x1 = self.conv_01(image)
         encs = []
-        last_stage1_var_feat = None
         for i, down in enumerate(self.down_path_1):
             if (i+1) < self.depth:
 
@@ -171,42 +148,16 @@ class EFNetOurs(nn.Module):
                 x1 = down(x1, event_filter=ev[i], merge_before_downsample=self.fuse_before_downsample)
 
         for i, up in enumerate(self.up_path_1):
-            x1 = up(x1, self.skip_conv_1[i](encs[-i-1]))
             ev_idx = self.depth - i - 2
+            x1 = up(x1, self.skip_conv_1[i](encs[-i-1]), event_filter=ev[ev_idx])
             
-#             var_ev = self.var_ev_stage1[i](ev[ev_idx])
             var_ev_flow = self.var_flow_stage1[i](ev_flow[ev_idx])
             
             x1 = self.up_path_1_memory[i](x1, var_ev_flow, flow)
 
-        var_stage1 = self.last_var_head(x1)
-        sam_feature, out_1 = self.sam12(x1, image)
-
-        x2 = self.conv_02(image)
-        x2 = self.cat12(torch.cat([x2, sam_feature], dim=1))
-        blocks = []
-        for i, down in enumerate(self.down_path_2):
-            if (i + 1) < self.depth:
-                x2, x2_up = down(
-                    x2,
-                    encs[i],
-                    event_filter=ev[i],
-                    merge_before_downsample=self.fuse_before_downsample,
-                )
-                blocks.append(x2_up)
-            else:
-                x2 = down(
-                    x2,
-                    event_filter=ev[i],
-                    merge_before_downsample=self.fuse_before_downsample,
-                )
-
-        for i, up in enumerate(self.up_path_2):
-            x2 = up(x2, self.skip_conv_2[i](blocks[-i - 1]))
-
-        out_2 = self.last(x2)
-        out_2 = out_2 + image
-        return [out_1, out_2], [var_stage1]
+        var_feature = self.last_var_head(x1)
+        _, out_1 = self.sam12(x1, image)
+        return [out_1], [var_feature]
 
     def get_input_chn(self, in_chn):
         return in_chn
@@ -304,13 +255,27 @@ class UNetEVConvBlock(nn.Module):
 
 
 class UNetUpBlock(nn.Module):
-    def __init__(self, in_size, out_size, relu_slope):
+    def __init__(
+        self,
+        in_size,
+        out_size,
+        relu_slope,
+        num_heads=None,
+        use_wcfe=None,
+    ):
         super(UNetUpBlock, self).__init__()
         self.up = nn.ConvTranspose2d(in_size, out_size, kernel_size=2, stride=2, bias=True)
-        self.conv_block = UNetConvBlock(in_size, out_size, False, relu_slope)
+        self.conv_block = UNetConvBlock(
+            out_size * 2,
+            out_size,
+            False,
+            relu_slope,
+            num_heads=num_heads,
+            use_wcfe=use_wcfe,
+        )
 
-    def forward(self, x, bridge):
+    def forward(self, x, bridge, event_filter=None):
         up = self.up(x)
         out = torch.cat([up, bridge], 1)
-        out = self.conv_block(out)
+        out = self.conv_block(out, event_filter=event_filter)
         return out
