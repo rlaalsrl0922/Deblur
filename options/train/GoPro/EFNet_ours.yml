@@ -96,7 +96,7 @@ train:
 
   pixel_opt:
     type: DualDomainL1Loss
-    loss_weight: 0.5
+    loss_weight: 1.0
     reduction: mean
     transform: fft
     freq_weight: 0.1
