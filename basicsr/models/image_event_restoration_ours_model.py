@@ -421,7 +421,7 @@ class ImageEventRestorationOurs(BaseModel):
             i = 0
             while i < n:
                 j = min(i + m, n)
-                if self.opt["datasets"]["val"].get("use_mask"):
+                if self.opt["datasets"].get("val", self.opt["datasets"].get("test", {})).get("use_mask"):
                     raw_pred = self.net_g(
                         x=self.lq[i:j, :, :, :],
                         event=self.voxel[i:j, :, :, :],

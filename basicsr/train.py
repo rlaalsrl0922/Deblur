@@ -2,6 +2,7 @@ import argparse
 import datetime
 import logging
 import math
+import os
 import random
 import time
 import torch
@@ -33,6 +34,14 @@ def parse_options(is_train=True):
     parser.add_argument('--local_rank', type=int, default=0)
     args = parser.parse_args()
     opt = parse(args.opt, is_train=is_train)
+
+    # The slot-pack jobs intentionally measure only the inexpensive metrics.
+    # Keep this guard here as well so a YAML copied from another experiment
+    # cannot accidentally re-enable LPIPS for those jobs.
+    if os.environ.get('DISABLE_LPIPS', '').lower() in {'1', 'true', 'yes', 'on'}:
+        val_opt = opt.get('val')
+        if isinstance(val_opt, dict) and isinstance(val_opt.get('metrics'), dict):
+            val_opt['metrics'].pop('lpips', None)
 
     # distributed settings
     if args.launcher == 'none':

@@ -1,0 +1,55 @@
+name: WEMP_test
+model_type: ImageEventRestorationOurs
+scale: 1
+num_gpu: 1
+manual_seed: 2026
+datasets:
+  test:
+    name: GoPro-test
+    type: H5ImageDataset
+    dataroot: ./datasets/GoPro/test
+    norm_voxel: true
+    return_voxel: true
+    return_mask: true
+    use_mask: true
+    io_backend:
+      type: h5
+    crop_size: null
+    use_flip: false
+    use_rot: false
+network_g:
+  type: EFNetOurs
+  in_chn: 3
+  ev_chn: 8
+  wf: 128
+  depth: 4
+  fuse_before_downsample: true
+  relu_slope: 0.2
+  num_heads:
+  - 4
+  - 4
+  - 4
+  - 4
+  var_fusion_max_disp: 3
+  var_fusion_num_heads: 4
+path:
+  pretrain_network_g: ./weights/wemp.pth
+  strict_load_g: true
+  param_key: params
+val:
+  save_img: true
+  max_minibatch: 1
+  rgb2bgr: true
+  use_image: true
+  metrics:
+    psnr:
+      type: calculate_psnr
+      crop_border: 0
+      test_y_channel: false
+    ssim:
+      type: calculate_ssim
+      crop_border: 0
+      test_y_channel: false
+dist_params:
+  backend: nccl
+  port: 29500

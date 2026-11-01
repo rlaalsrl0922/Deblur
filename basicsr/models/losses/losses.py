@@ -394,3 +394,190 @@ class WeightedTVLoss(L1Loss):
         loss = x_diff + y_diff
 
         return loss
+
+
+class FrequencyPSNRLoss(nn.Module):
+    """Frequency L1 + PSNR loss wrapper."""
+
+    def __init__(
+        self,
+        loss_weight=1.0,
+        reduction='mean',
+        freq_weight=1.0,
+        psnr_weight=1.0,
+        fft_norm='backward',
+        toY=False,
+    ):
+        super(FrequencyPSNRLoss, self).__init__()
+        if reduction != 'mean':
+            raise ValueError('FrequencyPSNRLoss only supports reduction="mean" because PSNRLoss requires it.')
+        else:
+            print("PSNR + L1 Freq activated")
+        self.loss_weight = loss_weight
+        self.freq_weight = freq_weight
+        self.psnr_weight = psnr_weight
+        self.freq_loss = FrequencyL1Loss(loss_weight=1.0, reduction=reduction, fft_norm=fft_norm)
+        self.psnr_loss = PSNRLoss(loss_weight=1.0, reduction=reduction, toY=toY)
+
+    def forward(self, pred, target, weight=None, **kwargs):
+        l_freq = self.freq_loss(pred, target, weight=weight, **kwargs)
+        l_psnr = self.psnr_loss(pred, target)
+        return self.loss_weight * (self.freq_weight * l_freq + self.psnr_weight * l_psnr)
+
+
+def _gaussian_window(window_size, sigma, channel, device, dtype):
+    coords = torch.arange(window_size, device=device, dtype=dtype) - window_size // 2
+    gauss = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
+    gauss = gauss / gauss.sum()
+    window_2d = torch.outer(gauss, gauss).unsqueeze(0).unsqueeze(0)
+    return window_2d.expand(channel, 1, window_size, window_size).contiguous()
+
+
+class SSIMLoss(nn.Module):
+    """Structural similarity loss.
+
+    The loss is defined as `1 - SSIM`, where SSIM is averaged per sample and
+    then reduced across the batch according to `reduction`.
+    """
+
+    def __init__(
+        self,
+        loss_weight=1.0,
+        reduction='mean',
+        window_size=11,
+        window_sigma=1.5,
+        data_range=1.0,
+        k1=0.01,
+        k2=0.03,
+        toY=False,
+    ):
+        super(SSIMLoss, self).__init__()
+        if reduction not in ['none', 'mean', 'sum']:
+            raise ValueError(f'Unsupported reduction mode: {reduction}. Supported ones are: {_reduction_modes}')
+        if window_size < 1:
+            raise ValueError('window_size must be >= 1.')
+        if window_sigma <= 0:
+            raise ValueError('window_sigma must be > 0.')
+
+        self.loss_weight = loss_weight
+        self.reduction = reduction
+        self.window_size = int(window_size)
+        self.window_sigma = float(window_sigma)
+        self.data_range = float(data_range)
+        self.k1 = float(k1)
+        self.k2 = float(k2)
+        self.toY = toY
+        self.coef = torch.tensor([65.481, 128.553, 24.966]).reshape(1, 3, 1, 1)
+
+    def _to_y_channel(self, x):
+        if x.size(1) != 3:
+            raise ValueError(f'toY=True expects 3-channel input, but got shape {tuple(x.shape)}.')
+        coef = self.coef.to(device=x.device, dtype=x.dtype)
+        return ((x * coef).sum(dim=1, keepdim=True) + 16.) / 255.
+
+    def forward(self, pred, target, weight=None, **kwargs):
+        if pred.shape != target.shape:
+            raise ValueError(f'Image shapes are different: {pred.shape}, {target.shape}.')
+        if pred.dim() != 4:
+            raise ValueError(f'SSIMLoss expects 4D tensors, but got {pred.dim()}D input.')
+
+        if self.toY:
+            pred = self._to_y_channel(pred)
+            target = self._to_y_channel(target)
+
+        _, channel, height, width = pred.shape
+        window_size = min(self.window_size, height, width)
+        if window_size % 2 == 0:
+            window_size -= 1
+        if window_size < 1:
+            raise ValueError(f'Invalid effective window size {window_size} for input shape {pred.shape}.')
+
+        window = _gaussian_window(
+            window_size,
+            self.window_sigma,
+            channel,
+            pred.device,
+            pred.dtype,
+        )
+        padding = window_size // 2
+
+        pred_pad = F.pad(pred, (padding, padding, padding, padding), mode='reflect')
+        target_pad = F.pad(target, (padding, padding, padding, padding), mode='reflect')
+
+        mu_pred = F.conv2d(pred_pad, window, groups=channel)
+        mu_target = F.conv2d(target_pad, window, groups=channel)
+
+        mu_pred_sq = mu_pred.pow(2)
+        mu_target_sq = mu_target.pow(2)
+        mu_pred_target = mu_pred * mu_target
+
+        sigma_pred_sq = (F.conv2d(F.pad(pred * pred, (padding, padding, padding, padding), mode='reflect'), window, groups=channel) - mu_pred_sq).clamp(min=0)
+        sigma_target_sq = (F.conv2d(F.pad(target * target, (padding, padding, padding, padding), mode='reflect'), window, groups=channel) - mu_target_sq).clamp(min=0)
+        sigma_pred_target = F.conv2d(F.pad(pred * target, (padding, padding, padding, padding), mode='reflect'), window, groups=channel) - mu_pred_target
+
+        c1 = (self.k1 * self.data_range) ** 2
+        c2 = (self.k2 * self.data_range) ** 2
+        ssim_map = ((2 * mu_pred_target + c1) * (2 * sigma_pred_target + c2)) / (
+            (mu_pred_sq + mu_target_sq + c1) * (sigma_pred_sq + sigma_target_sq + c2) + 1e-12
+        )
+
+        loss = 1 - ssim_map.mean(dim=(1, 2, 3))
+
+        if weight is not None:
+            if weight.dim() == 1 and weight.shape[0] == loss.shape[0]:
+                sample_weight = weight
+            elif weight.dim() == 4 and weight.shape[0] == loss.shape[0]:
+                sample_weight = weight.mean(dim=(1, 2, 3))
+            else:
+                raise ValueError(
+                    'SSIMLoss weight must have shape (N,) or (N, C, H, W) '
+                    f'with matching batch size, but got {tuple(weight.shape)}.'
+                )
+            loss = loss * sample_weight.to(device=loss.device, dtype=loss.dtype)
+
+        if self.reduction == 'none':
+            return self.loss_weight * loss
+        if self.reduction == 'sum':
+            return self.loss_weight * loss.sum()
+        return self.loss_weight * loss.mean()
+
+
+class SSIMPSNRLoss(nn.Module):
+    """SSIM + PSNR loss wrapper."""
+
+    def __init__(
+        self,
+        loss_weight=1.0,
+        reduction='mean',
+        ssim_weight=1.0,
+        psnr_weight=1.0,
+        window_size=11,
+        window_sigma=1.5,
+        data_range=1.0,
+        k1=0.01,
+        k2=0.03,
+        toY=False,
+    ):
+        super(SSIMPSNRLoss, self).__init__()
+        if reduction != 'mean':
+            raise ValueError('SSIMPSNRLoss only supports reduction="mean" because PSNRLoss requires it.')
+
+        self.loss_weight = loss_weight
+        self.ssim_weight = ssim_weight
+        self.psnr_weight = psnr_weight
+        self.ssim_loss = SSIMLoss(
+            loss_weight=1.0,
+            reduction=reduction,
+            window_size=window_size,
+            window_sigma=window_sigma,
+            data_range=data_range,
+            k1=k1,
+            k2=k2,
+            toY=toY,
+        )
+        self.psnr_loss = PSNRLoss(loss_weight=1.0, reduction=reduction, toY=toY)
+
+    def forward(self, pred, target, weight=None, **kwargs):
+        l_ssim = self.ssim_loss(pred, target, weight=weight, **kwargs)
+        l_psnr = self.psnr_loss(pred, target)
+        return self.loss_weight * (self.ssim_weight * l_ssim + self.psnr_weight * l_psnr)

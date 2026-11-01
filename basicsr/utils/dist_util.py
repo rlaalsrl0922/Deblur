@@ -8,6 +8,34 @@ import torch.multiprocessing as mp
 from datetime import timedelta
 
 
+def _get_process_group_timeout():
+    """Return the c10d timeout, with a per-job environment override.
+
+    PyTorch treats ``timeout=None`` as "use its default" rather than as an
+    infinite timeout.  Keep the previous 60-minute default for other jobs,
+    while allowing long-running jobs to request an effectively unlimited
+    timeout explicitly.
+    """
+    timeout_days = os.environ.get('TORCH_DIST_TIMEOUT_DAYS')
+    if timeout_days is None:
+        return timedelta(minutes=60)
+
+    timeout_days = int(timeout_days)
+    if timeout_days <= 0:
+        raise ValueError('TORCH_DIST_TIMEOUT_DAYS must be positive')
+    return timedelta(days=timeout_days)
+
+
+def _get_rendezvous_timeout():
+    """Keep startup/peer discovery failures on a normal timeout."""
+    timeout_seconds = int(
+        os.environ.get('TORCH_DIST_RENDEZVOUS_TIMEOUT_SECONDS', '300'))
+    if timeout_seconds <= 0:
+        raise ValueError(
+            'TORCH_DIST_RENDEZVOUS_TIMEOUT_SECONDS must be positive')
+    return timedelta(seconds=timeout_seconds)
+
+
 def init_dist(launcher, backend='nccl', **kwargs):
     if mp.get_start_method(allow_none=True) is None:
         mp.set_start_method('spawn')
@@ -21,9 +49,29 @@ def init_dist(launcher, backend='nccl', **kwargs):
 
 def _init_dist_pytorch(backend, **kwargs):
     rank = int(os.environ['RANK'])
+    world_size = int(os.environ['WORLD_SIZE'])
     num_gpus = torch.cuda.device_count()
     torch.cuda.set_device(rank % num_gpus)
-    dist.init_process_group(backend=backend, timeout=timedelta(minutes=60) , **kwargs)
+
+    # Keep the rendezvous socket timeout independent from the collective
+    # timeout.  Otherwise a deliberately long NCCL collective timeout also
+    # makes a missing peer look like a multi-century socket hang.  Use
+    # PyTorch's env:// rendezvous helper so torchrun's agent-store mode is
+    # handled correctly.
+    if 'TORCH_DIST_TIMEOUT_DAYS' in os.environ:
+        rendezvous = dist.rendezvous(
+            'env://', timeout=_get_rendezvous_timeout())
+        store, rank, world_size = next(rendezvous)
+        dist.init_process_group(
+            backend=backend,
+            store=store,
+            rank=rank,
+            world_size=world_size,
+            timeout=_get_process_group_timeout(),
+            **kwargs)
+    else:
+        dist.init_process_group(
+            backend=backend, timeout=_get_process_group_timeout(), **kwargs)
 
 
 def _init_dist_slurm(backend, port=None):

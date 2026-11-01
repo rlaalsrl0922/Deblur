@@ -1,7 +1,5 @@
 import numpy as np
 import torch
-import pyiqa
-
 from basicsr.metrics.metric_util import reorder_image, to_y_channel
 
 
@@ -9,6 +7,7 @@ _LPIPS_METRIC_CACHE = {}
 
 
 def _get_lpips_metric(device):
+    import pyiqa
     """Create or reuse cached LPIPS metric."""
     device = torch.device(device) if device is not None else (
         torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")

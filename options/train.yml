@@ -1,0 +1,113 @@
+# 124 로컬 사본의 학습 예제. 논문 최종 실행 설정으로 검증된 파일이 아닙니다.
+name: WEMP_train_example
+model_type: ImageEventRestorationOurs
+scale: 1
+num_gpu: 2
+manual_seed: 1
+datasets:
+  train:
+    name: gopro-h5-train
+    type: H5ImageDataset
+    dataroot: ./datasets/GoPro/train
+    norm_voxel: true
+    return_voxel: true
+    return_mask: true
+    use_mask: true
+    filename_tmpl: '{}'
+    io_backend:
+      type: h5
+    crop_size: 256
+    use_flip: true
+    use_rot: true
+    use_shuffle: true
+    num_worker_per_gpu: 1
+    batch_size_per_gpu: 2
+    dataset_enlarge_ratio: 2
+    prefetch_mode: cuda
+    num_prefetch_queue: 2
+    pin_memory: true
+  val:
+    name: gopro-h5-test
+    type: H5ImageDataset
+    dataroot: ./datasets/GoPro/val
+    norm_voxel: true
+    return_voxel: true
+    return_mask: true
+    use_mask: true
+    io_backend:
+      type: h5
+    crop_size: null
+    use_flip: false
+    use_rot: false
+dataset_name: GoPro
+network_g:
+  type: EFNetOurs
+  in_chn: 3
+  ev_chn: 8
+  wf: 128
+  depth: 4
+  fuse_before_downsample: true
+  relu_slope: 0.2
+  num_heads:
+  - 4
+  - 4
+  - 4
+  - 4
+  var_fusion_max_disp: 3
+  var_fusion_num_heads: 4
+path:
+  pretrain_network_g: null
+  strict_load_g: true
+  resume_state: null
+  training_states: null
+train:
+  optim_g:
+    type: AdamW
+    lr: 0.0002
+    weight_decay: 0.0001
+    betas:
+    - 0.9
+    - 0.99
+  scheduler:
+    type: TrueCosineAnnealingLR
+    T_max: 300000
+    eta_min: 1.0e-07
+  total_iter: 300000
+  warmup_iter: -1
+  pixel_opt:
+    type: DualDomainL1Loss
+    loss_weight: 1.0
+    reduction: mean
+    transform: fft
+    freq_weight: 0.1
+    fft_norm: backward
+  hf_udl_opt:
+    enable: true
+    loss_weight: 50
+val:
+  val_freq: 50000.0
+  save_img: false
+  grids: null
+  crop_size: null
+  max_minibatch: 8
+  metrics:
+    psnr:
+      type: calculate_psnr
+      crop_border: 0
+      test_y_channel: false
+    ssim:
+      type: calculate_ssim
+      crop_border: 0
+      test_y_channel: false
+    lpips:
+      type: calculate_lpips
+      crop_border: 0
+      test_y_channel: false
+logger:
+  print_freq: 200
+  save_checkpoint_freq: 20000.0
+  use_tb_logger: true
+  wandb: null
+dist_params:
+  backend: nccl
+  port: 29500
